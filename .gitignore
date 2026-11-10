@@ -1,0 +1,8 @@
+node_modules/
+dist/
+public/wasm/
+coverage/
+.vite/
+*.log
+.DS_Store
+Thumbs.db

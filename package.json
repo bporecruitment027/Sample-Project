@@ -1,0 +1,25 @@
+{
+  "name": "private-live-transcriber",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Privacy-first browser-based live Windows system audio transcription web application using local Whisper ONNX inference (WebGPU / WebAssembly).",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/prepare-wasm.mjs && vite --host 0.0.0.0 --port 5173",
+    "build": "node scripts/prepare-wasm.mjs && tsc --noEmit && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "jsdom": "^31.0.0",
+    "typescript": "5.9.3",
+    "vite": "^8.3.7",
+    "vitest": "^5.1.0"
+  }
+}
