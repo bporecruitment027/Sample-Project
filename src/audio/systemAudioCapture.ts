@@ -2,11 +2,16 @@ import type {
   AppAlert,
   AudioActivityStatus,
   AudioConnectionStatus,
+  AudioEnhancementMode,
   AudioLevelMetrics,
+  CaptureSourceMode,
+  ChannelSelectionMode,
+  ChannelTopology,
   DiagnosticProfileId,
 } from '../types/index.ts';
-import { DIAGNOSTIC_PROFILES } from '../config/models.ts';
-import { rmsToDbfs } from './dsp.ts';
+import { CAPTURE_SOURCE_MODES, DIAGNOSTIC_PROFILES } from '../config/models.ts';
+import { TARGET_SAMPLE_RATE, rmsToDbfs } from './dsp.ts';
+import { EphemeralAudioEnhancer } from './enhancement.ts';
 
 export interface SystemAudioCaptureCallbacks {
   onConnectionStatus: (status: AudioConnectionStatus) => void;
@@ -17,12 +22,25 @@ export interface SystemAudioCaptureCallbacks {
   onExternalOrUnexpectedStop: (alert: AppAlert) => void;
 }
 
-const ACTIVITY_RMS_THRESHOLD = 0.0045;
+export interface DetailedTrackInfo {
+  captureMode: CaptureSourceMode;
+  displaySurface: string;
+  trackLabel: string;
+  sampleRateHz: number | null;
+  trackSampleRateHz: number | null;
+  channelCount: number;
+  trackReadyState: string;
+  trackMuted: boolean;
+  isLive: boolean;
+}
+
+const ACTIVITY_RMS_THRESHOLD = 0.0035;
 const ACTIVITY_HOLD_MS = 900;
 const NO_ACTIVITY_WARNING_MS = 12_000;
 
 export class SystemAudioCaptureController {
   private readonly callbacks: SystemAudioCaptureCallbacks;
+  private readonly enhancer = new EphemeralAudioEnhancer('gentle');
 
   private mediaStream: MediaStream | null = null;
   private audioContext: AudioContext | null = null;
@@ -34,6 +52,10 @@ export class SystemAudioCaptureController {
   private paused = false;
   private forwardingSamples = false;
 
+  private captureMode: CaptureSourceMode = 'entire-screen-system';
+  private channelMode: ChannelSelectionMode = 'auto';
+  private selectedDisplaySurface = '';
+
   private lastActiveAtMs = 0;
   private everDetectedSound = false;
   private currentActivity: AudioActivityStatus = 'Audio inactive';
@@ -42,6 +64,8 @@ export class SystemAudioCaptureController {
 
   private audioTrackLabel = '';
   private hardwareSampleRate: number | null = null;
+  private trackReportedSampleRate: number | null = null;
+  private observedChannelCount = 2;
 
   constructor(callbacks: SystemAudioCaptureCallbacks) {
     this.callbacks = callbacks;
@@ -51,11 +75,45 @@ export class SystemAudioCaptureController {
     this.activeProfile = profile;
   }
 
-  public getTrackInfo(): { trackLabel: string; sampleRateHz: number | null; isLive: boolean } {
+  public setCaptureMode(mode: CaptureSourceMode): void {
+    this.captureMode = mode;
+  }
+
+  public getCaptureMode(): CaptureSourceMode {
+    return this.captureMode;
+  }
+
+  public setChannelSelectionMode(mode: ChannelSelectionMode): void {
+    this.channelMode = mode;
+    this.workletNode?.port.postMessage({
+      type: 'set-channel-mode',
+      channelMode: mode,
+    });
+  }
+
+  public getChannelSelectionMode(): ChannelSelectionMode {
+    return this.channelMode;
+  }
+
+  public setEnhancementMode(mode: AudioEnhancementMode): void {
+    this.enhancer.setMode(mode);
+  }
+
+  public getEnhancementMode(): AudioEnhancementMode {
+    return this.enhancer.getMode();
+  }
+
+  public getTrackInfo(): DetailedTrackInfo {
     const audioTrack = this.mediaStream?.getAudioTracks()[0];
     return {
+      captureMode: this.captureMode,
+      displaySurface: this.selectedDisplaySurface,
       trackLabel: this.audioTrackLabel,
       sampleRateHz: this.hardwareSampleRate,
+      trackSampleRateHz: this.trackReportedSampleRate,
+      channelCount: this.observedChannelCount,
+      trackReadyState: audioTrack ? audioTrack.readyState : 'none',
+      trackMuted: Boolean(audioTrack?.muted),
       isLive: Boolean(audioTrack && audioTrack.readyState === 'live'),
     };
   }
@@ -95,7 +153,10 @@ export class SystemAudioCaptureController {
       };
     }
 
-    if (typeof AudioContext === 'undefined' && typeof (globalThis as Record<string, unknown>).webkitAudioContext === 'undefined') {
+    if (
+      typeof AudioContext === 'undefined' &&
+      typeof (globalThis as Record<string, unknown>).webkitAudioContext === 'undefined'
+    ) {
       return {
         supported: false,
         alert: {
@@ -111,9 +172,9 @@ export class SystemAudioCaptureController {
   }
 
   /**
-   * Must be invoked directly from an explicit user button click (START TRANSCRIPTION or Run Diagnostics).
-   * Requests Chrome screen sharing with systemAudio: "include", validates the returned audio track,
-   * discards video rendering, and connects the AudioWorklet pipeline.
+   * Must be invoked directly from an explicit user button click (START TRANSCRIPTION or Test Audio Only).
+   * Supports Entire Screen + System Audio, Window + Application Audio (Win 11 / supported Chrome), and
+   * Window + System Audio. Verifies usable audio track without ever falling back to microphone.
    */
   public async startCapture(forwardSpeechSamplesImmediately: boolean): Promise<boolean> {
     const support = SystemAudioCaptureController.checkBrowserSupport();
@@ -129,13 +190,15 @@ export class SystemAudioCaptureController {
     this.everDetectedSound = false;
     this.lastActiveAtMs = 0;
     this.currentActivity = 'Audio inactive';
+    this.selectedDisplaySurface = '';
+    this.enhancer.resetAndZero();
 
     this.callbacks.onConnectionStatus('Requesting screen-sharing permission');
     this.callbacks.onActivityStatus('Audio inactive');
 
     let stream: MediaStream;
     try {
-      stream = await this.requestDisplayStreamWithSystemAudio();
+      stream = await this.requestDisplayStreamForSelectedMode();
     } catch (err) {
       this.callbacks.onConnectionStatus('Not connected');
       this.callbacks.onAlert(this.mapDisplayMediaError(err));
@@ -145,54 +208,71 @@ export class SystemAudioCaptureController {
     this.mediaStream = stream;
     this.callbacks.onConnectionStatus('Screen sharing active');
 
-    // Inspect video track (never render, screenshot, or record video!)
+    // Inspect video track (never process, render, screenshot, or save video!)
     const videoTracks = stream.getVideoTracks();
-    let selectedDisplaySurface = '';
     for (const vTrack of videoTracks) {
       try {
         const settings = vTrack.getSettings?.() as MediaTrackSettings & {
           displaySurface?: string;
         };
         if (settings?.displaySurface) {
-          selectedDisplaySurface = settings.displaySurface;
+          this.selectedDisplaySurface = settings.displaySurface;
         }
       } catch {
         // Ignore settings read errors
       }
-      // Disable frame output so Chrome delivers muted frames with near-zero overhead
-      // while keeping Chrome's visible sharing banner and Stop Sharing control active.
       vTrack.enabled = false;
     }
 
     // Inspect audio tracks — NEVER fall back to microphone!
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0 || audioTracks[0].readyState === 'ended') {
+      const chosenSurface = this.selectedDisplaySurface;
       await this.stopAndCleanup();
       this.callbacks.onConnectionStatus('No system audio detected');
 
       const profileGuidance = DIAGNOSTIC_PROFILES[this.activeProfile].routingGuidance;
-      const selectedWindowInsteadOfScreen =
-        selectedDisplaySurface === 'window' || selectedDisplaySurface === 'browser';
+      const selectedWindow = chosenSurface === 'window' || chosenSurface === 'browser';
+
+      const windowModeExplanation =
+        this.captureMode !== 'entire-screen-system'
+          ? 'Your Windows/Chrome build did not provide per-window application audio for the selected window (per-window audio requires supported Windows 11 + Chrome application-audio builds). Switch Capture Source to "A. Entire Screen + System Audio".'
+          : 'You shared an individual window or tab without system audio. On Windows, Chrome reliably provides desktop softphone audio when you share "Entire Screen" and enable "Also share system audio".';
 
       this.callbacks.onAlert({
-        code: selectedWindowInsteadOfScreen ? 'SYSTEM_AUDIO_NOT_SELECTED' : 'NO_AUDIO_TRACK',
+        code: selectedWindow ? 'SYSTEM_AUDIO_NOT_SELECTED' : 'NO_AUDIO_TRACK',
         severity: 'error',
-        title: selectedWindowInsteadOfScreen
-          ? 'System Audio Was Not Selected (Window Shared Instead of Entire Screen)'
+        title: selectedWindow
+          ? 'No Usable Audio Track Attached to Shared Window'
           : 'No Accessible Windows System Audio Track Returned',
-        message: selectedWindowInsteadOfScreen
-          ? 'You shared an individual window or tab without system audio. On Windows, Chrome only captures desktop softphone audio when you share "Entire Screen" and enable "Also share system audio".'
+        message: selectedWindow
+          ? windowModeExplanation
           : 'Chrome is sharing your screen, but Windows has not provided an accessible system audio track. Check whether you enabled "Also share system audio" in Chrome\'s dialog, and check whether NICE CXone or Avaya is routing call audio through a separate audio endpoint.',
-        remediation: `1) Click START TRANSCRIPTION again -> select the "Entire Screen" tab -> choose your monitor -> turn ON "Also share system audio" -> click Share. 2) ${profileGuidance}`,
+        remediation: `1) Select Capture Source "A. Entire Screen + System Audio" -> click START TRANSCRIPTION -> choose "Entire Screen" -> turn ON "Also share system audio" -> Share. 2) ${profileGuidance}`,
       });
       return false;
     }
 
     const primaryAudioTrack = audioTracks[0];
     this.audioTrackLabel = primaryAudioTrack.label || 'Windows System Output Audio';
+
+    // Read actual hardware track settings reported by Chromium
+    try {
+      const aSettings = primaryAudioTrack.getSettings?.();
+      if (aSettings) {
+        if (typeof aSettings.sampleRate === 'number' && aSettings.sampleRate > 0) {
+          this.trackReportedSampleRate = aSettings.sampleRate;
+        }
+        if (typeof aSettings.channelCount === 'number' && aSettings.channelCount > 0) {
+          this.observedChannelCount = aSettings.channelCount;
+        }
+      }
+    } catch {
+      // Ignore track settings read errors
+    }
+
     this.callbacks.onConnectionStatus('System audio detected');
 
-    // Attach lifecycle listeners for external user stop or unexpected endpoint disconnect
     const handleTrackEnded = (source: 'video' | 'audio') => {
       if (this.stoppingInternally) {
         return;
@@ -211,7 +291,7 @@ export class SystemAudioCaptureController {
               severity: 'warning',
               title: 'System Audio Capture Stopped Unexpectedly',
               message:
-                'The Windows system audio track ended unexpectedly (for example, a headset or softphone audio endpoint changed state). Temporary session data was cleared.',
+                'The Windows audio track ended unexpectedly (for example, headset profile switch or softphone endpoint change). Temporary session data was cleared.',
               remediation:
                 'Verify your headset is connected in Windows Sound output and click START TRANSCRIPTION to begin a fresh session.',
             };
@@ -225,9 +305,14 @@ export class SystemAudioCaptureController {
     }
     for (const aTrack of audioTracks) {
       aTrack.addEventListener('ended', () => handleTrackEnded('audio'), { once: true });
+      aTrack.addEventListener?.('mute', () => {
+        if (!this.stoppingInternally && !this.paused) {
+          this.callbacks.onActivityStatus('Audio inactive');
+        }
+      });
     }
 
-    // Build Web Audio + AudioWorklet pipeline
+    // Build Web Audio + AudioWorklet pipeline at native hardware sample rate
     try {
       const AudioCtx =
         window.AudioContext ??
@@ -248,7 +333,6 @@ export class SystemAudioCaptureController {
       const workletUrl = new URL('./audio-capture-worklet.js', window.location.href).href;
       await ctx.audioWorklet.addModule(workletUrl);
 
-      // Build an audio-only MediaStream wrapper so MediaStreamAudioSourceNode ignores video tracks
       const audioOnlyStream = new MediaStream([primaryAudioTrack]);
       const source = ctx.createMediaStreamSource(audioOnlyStream);
       const worklet = new AudioWorkletNode(ctx, 'ephemeral-pcm-capture-processor', {
@@ -257,14 +341,16 @@ export class SystemAudioCaptureController {
         outputChannelCount: [1],
       });
 
-      // Zero-gain sink keeps Chromium's pull-based Web Audio rendering quantum active
-      // while guaranteeing 0.000 audible output (zero echo/loopback feedback).
       const silentGain = ctx.createGain();
       silentGain.gain.value = 0;
 
       worklet.port.postMessage({
         type: 'set-forwarding',
         forwardSamples: this.forwardingSamples,
+      });
+      worklet.port.postMessage({
+        type: 'set-channel-mode',
+        channelMode: this.channelMode,
       });
 
       worklet.port.onmessage = (event: MessageEvent) => {
@@ -310,6 +396,7 @@ export class SystemAudioCaptureController {
   public pause(): void {
     this.paused = true;
     this.clearNoActivityWatchdog();
+    this.enhancer.resetAndZero();
     this.workletNode?.port.postMessage({ type: 'pause', paused: true });
     this.currentActivity = 'Audio inactive';
     this.callbacks.onActivityStatus('Audio inactive');
@@ -317,6 +404,18 @@ export class SystemAudioCaptureController {
       rms: 0,
       peak: 0,
       dbfs: -100,
+      peakDbfs: -100,
+      leftRms: 0,
+      rightRms: 0,
+      leftDbfs: -100,
+      rightDbfs: -100,
+      channelCount: this.observedChannelCount,
+      channelTopology: 'silent',
+      channelCorrelation: 0,
+      sourceSampleRate: this.hardwareSampleRate ?? undefined,
+      outputSampleRate: TARGET_SAMPLE_RATE,
+      enhancementMode: this.enhancer.getMode(),
+      enhancementGainDb: 0,
       speechBandRatio: 0,
       clipping: false,
       isSpeechActive: false,
@@ -331,19 +430,12 @@ export class SystemAudioCaptureController {
     }
   }
 
-  /**
-   * Executes complete audio & screen-capture teardown:
-   * - Signals AudioWorklet to wipe buffers and terminate
-   * - Closes MessagePort
-   * - Disconnects source, worklet, and gain nodes
-   * - Closes AudioContext
-   * - Stops all audio & video MediaStreamTracks
-   */
   public async stopAndCleanup(): Promise<void> {
     this.stoppingInternally = true;
     this.paused = false;
     this.forwardingSamples = false;
     this.clearNoActivityWatchdog();
+    this.enhancer.resetAndZero();
 
     if (this.workletNode) {
       try {
@@ -405,32 +497,49 @@ export class SystemAudioCaptureController {
 
     this.audioTrackLabel = '';
     this.hardwareSampleRate = null;
+    this.trackReportedSampleRate = null;
+    this.selectedDisplaySurface = '';
     this.currentActivity = 'Audio inactive';
   }
 
-  private async requestDisplayStreamWithSystemAudio(): Promise<MediaStream> {
-    const preferredConstraints = {
+  private async requestDisplayStreamForSelectedMode(): Promise<MediaStream> {
+    // Disable browser microphone-oriented DSP (echoCancellation/noiseSuppression/autoGainControl)
+    // so Chrome delivers clean, unaltered system output PCM.
+    const cleanAudioConstraints: MediaTrackConstraints = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+    };
+
+    const preferredSurface =
+      this.captureMode === 'entire-screen-system' ? 'monitor' : 'window';
+
+    const extendedOptions: Record<string, unknown> = {
       video: {
-        displaySurface: 'monitor',
+        displaySurface: preferredSurface,
         frameRate: { ideal: 1, max: 5 },
         width: { max: 320 },
         height: { max: 240 },
       },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
+      audio: cleanAudioConstraints,
       systemAudio: 'include',
       selfBrowserSurface: 'exclude',
       surfaceSwitching: 'exclude',
-    } as DisplayMediaStreamOptions;
+    };
+
+    if (this.captureMode === 'window-app-audio') {
+      // Chromium Windows 11 per-window application audio hint where supported
+      extendedOptions.windowAudio = 'window';
+    } else if (this.captureMode === 'window-system-audio') {
+      extendedOptions.windowAudio = 'system';
+    }
 
     try {
-      return await navigator.mediaDevices.getDisplayMedia(preferredConstraints);
+      return await navigator.mediaDevices.getDisplayMedia(
+        extendedOptions as DisplayMediaStreamOptions,
+      );
     } catch (err) {
       const name = (err as DOMException)?.name ?? '';
-      // Only fall back to minimal standard constraints if extended constraint keys caused TypeError/OverconstrainedError
       if (name === 'TypeError' || name === 'OverconstrainedError') {
         return navigator.mediaDevices.getDisplayMedia({
           video: true,
@@ -471,9 +580,8 @@ export class SystemAudioCaptureController {
         severity: 'warning',
         title: 'Screen-Sharing Permission Cancelled or Denied',
         message:
-          'Screen and system audio sharing was cancelled or denied. No audio is being captured.',
-        remediation:
-          'When ready, click START TRANSCRIPTION, choose "Entire Screen", enable "Also share system audio", and click Share.',
+          'Screen and audio sharing was cancelled or denied. No audio is being captured.',
+        remediation: `When ready, click START TRANSCRIPTION (${CAPTURE_SOURCE_MODES[this.captureMode].chromeStepHint}).`,
       };
     }
 
@@ -516,6 +624,12 @@ export class SystemAudioCaptureController {
       type?: string;
       rms?: number;
       peak?: number;
+      leftRms?: number;
+      rightRms?: number;
+      channelCount?: number;
+      channelTopology?: ChannelTopology;
+      channelCorrelation?: number;
+      sourceSampleRate?: number;
       speechBandRatio?: number;
       clipping?: boolean;
       samples?: Float32Array;
@@ -531,9 +645,18 @@ export class SystemAudioCaptureController {
     if (msg.type === 'level') {
       const rms = typeof msg.rms === 'number' ? msg.rms : 0;
       const peak = typeof msg.peak === 'number' ? msg.peak : 0;
+      const leftRms = typeof msg.leftRms === 'number' ? msg.leftRms : rms;
+      const rightRms = typeof msg.rightRms === 'number' ? msg.rightRms : rms;
       const speechBandRatio = typeof msg.speechBandRatio === 'number' ? msg.speechBandRatio : 0;
       const clipping = Boolean(msg.clipping);
       const now = Date.now();
+
+      if (typeof msg.channelCount === 'number' && msg.channelCount > 0) {
+        this.observedChannelCount = msg.channelCount;
+      }
+      if (typeof msg.sourceSampleRate === 'number' && msg.sourceSampleRate > 0) {
+        this.hardwareSampleRate = msg.sourceSampleRate;
+      }
 
       if (rms >= ACTIVITY_RMS_THRESHOLD) {
         this.lastActiveAtMs = now;
@@ -560,6 +683,18 @@ export class SystemAudioCaptureController {
         rms,
         peak,
         dbfs: rmsToDbfs(rms),
+        peakDbfs: rmsToDbfs(peak),
+        leftRms,
+        rightRms,
+        leftDbfs: rmsToDbfs(leftRms),
+        rightDbfs: rmsToDbfs(rightRms),
+        channelCount: this.observedChannelCount,
+        channelTopology: msg.channelTopology ?? 'identical-stereo',
+        channelCorrelation: msg.channelCorrelation ?? 1,
+        sourceSampleRate: this.hardwareSampleRate ?? undefined,
+        outputSampleRate: TARGET_SAMPLE_RATE,
+        enhancementMode: this.enhancer.getMode(),
+        enhancementGainDb: this.enhancer.getLastAppliedGainDb(),
         speechBandRatio,
         clipping,
         isSpeechActive: isActive && speechBandRatio >= 0.14,
@@ -572,7 +707,10 @@ export class SystemAudioCaptureController {
         msg.samples.fill(0);
         return;
       }
-      this.callbacks.onPcmChunk16k(msg.samples);
+      // Run optional in-memory audio enhancement (or exact raw bypass when 'off')
+      const enhanced = this.enhancer.processChunk16k(msg.samples);
+      msg.samples.fill(0);
+      this.callbacks.onPcmChunk16k(enhanced.samples);
     }
   }
 
@@ -584,10 +722,10 @@ export class SystemAudioCaptureController {
         this.callbacks.onAlert({
           code: 'NO_AUDIO_ACTIVITY',
           severity: 'warning',
-          title: 'No Audio Activity Detected Yet',
+          title: 'Active Track Connected, But Zero Sound Energy Detected',
           message:
-            'System audio track is connected, but no sound energy has been detected yet.',
-          remediation: `Play harmless sample audio to confirm capture. If sound is playing in your headset without moving the level meter: ${routingTip}`,
+            'Chrome returned a live audio track, yet 0.000 sound energy (-100 dBFS) has reached the browser.',
+          remediation: `Play harmless sample audio to confirm capture. If audible in your headset while -100 dBFS here: ${routingTip}`,
         });
       }
     }, NO_ACTIVITY_WARNING_MS);

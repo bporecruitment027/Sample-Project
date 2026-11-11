@@ -17,14 +17,14 @@
           <div>
             <h1 class="app-title">Private Live Transcriber</h1>
             <p class="app-subtitle">
-              Local Browser Windows System Audio Transcription · No Cloud · No Recording · No Storage
+              Local Browser Windows System Audio Transcription · Australian Automotive &amp; Telephony Tuned · Zero Cloud / Zero Storage
             </p>
           </div>
         </div>
 
         <div class="header-badges" aria-label="System and privacy status">
           <span id="header-privacy-badge" class="pill pill-neutral">Verifying Local Engine...</span>
-          <span id="header-engine-badge" class="pill pill-slate">Engine: Whisper Base.en</span>
+          <span id="header-engine-badge" class="pill pill-slate">Engine: Whisper Small.en</span>
           <span id="header-mode-badge" class="pill pill-slate">Mode: Auto (WebGPU / WASM)</span>
           <a
             id="standalone-tab-link"
@@ -72,8 +72,8 @@
 
           <div class="status-item instruction-callout">
             <span class="status-caption">CHROME PERMISSION STEP</span>
-            <span class="instruction-steps">
-              Select <strong>Entire Screen</strong> → Enable <strong>Share system audio</strong> → Click <strong>Share</strong>
+            <span id="chrome-step-hint" class="instruction-steps">
+              Select <strong>Entire Screen</strong> → Enable <strong>Also share system audio</strong> → Click <strong>Share</strong>
             </span>
           </div>
         </div>
@@ -109,11 +109,14 @@
             <div class="field-group">
               <label for="select-model" class="field-label">Local Whisper Model</label>
               <select id="select-model" class="field-select">
-                <option value="base.en" selected>
-                  Whisper Base.en — Balanced Accuracy (Default)
+                <option value="small.en" selected>
+                  Whisper Small.en — High Accuracy Telephony (Preferred)
+                </option>
+                <option value="base.en">
+                  Whisper Base.en — Balanced CPU Alternative
                 </option>
                 <option value="tiny.en">
-                  Whisper Tiny.en — Fast CPU Performance Fallback
+                  Whisper Tiny.en — Low-Resource Fallback Only
                 </option>
               </select>
             </div>
@@ -127,7 +130,31 @@
             </div>
 
             <div class="field-group">
-              <label for="select-profile" class="field-label">Diagnostic Test Label</label>
+              <label for="select-capture-mode" class="field-label">Chrome Capture Source</label>
+              <select id="select-capture-mode" class="field-select">
+                <option value="entire-screen-system" selected>
+                  A. Entire Screen + System Audio (Recommended)
+                </option>
+                <option value="window-app-audio">
+                  B. App Window + Application Audio (Win 11 / Supported Chrome)
+                </option>
+                <option value="window-system-audio">
+                  C. App Window + System Audio (Where Supported)
+                </option>
+              </select>
+            </div>
+
+            <div class="field-group">
+              <label for="select-enhancement" class="field-label">Audio Enhancement (Live)</label>
+              <select id="select-enhancement" class="field-select">
+                <option value="gentle" selected>Gentle Telephony Clarity (Default)</option>
+                <option value="quiet-boost">Quiet Call Boost (+16 dB Max Safe Gain)</option>
+                <option value="off">Off — Raw Captured Audio (Compare)</option>
+              </select>
+            </div>
+
+            <div class="field-group">
+              <label for="select-profile" class="field-label">Phone System Test Label</label>
               <select id="select-profile" class="field-select">
                 <option value="standard" selected>Standard System Audio</option>
                 <option value="nice-cxone">NICE CXone Test (Label Only)</option>
@@ -136,6 +163,52 @@
               </select>
             </div>
           </div>
+
+          <!-- Adjustable Segmentation & Channel Controls -->
+          <details class="tuning-drawer">
+            <summary>Advanced Audio Channel &amp; Speech Segmentation Tuning (20s / 3s Overlap / 1.2s Pause)</summary>
+            <div class="tuning-grid">
+              <div class="field-group">
+                <label for="select-channel-mode" class="field-label">Stereo / Mono Channel Handling</label>
+                <select id="select-channel-mode" class="field-select">
+                  <option value="auto" selected>Auto Inspect L/R (Preserves Single-Sided +6 dB)</option>
+                  <option value="left">Left Channel Only</option>
+                  <option value="right">Right Channel Only</option>
+                  <option value="stereo-sum">Standard Stereo Average (0.5 L+R)</option>
+                </select>
+              </div>
+
+              <div class="field-group">
+                <label for="select-seg-length" class="field-label">Max Segment Length</label>
+                <select id="select-seg-length" class="field-select">
+                  <option value="12">12 seconds (Lower Latency)</option>
+                  <option value="15">15 seconds</option>
+                  <option value="20" selected>20 seconds (Recommended Default)</option>
+                  <option value="25">25 seconds</option>
+                </select>
+              </div>
+
+              <div class="field-group">
+                <label for="select-seg-overlap" class="field-label">Boundary Overlap</label>
+                <select id="select-seg-overlap" class="field-select">
+                  <option value="1">1.0 second</option>
+                  <option value="2">2.0 seconds</option>
+                  <option value="3" selected>3.0 seconds (Recommended Default)</option>
+                  <option value="4">4.0 seconds</option>
+                </select>
+              </div>
+
+              <div class="field-group">
+                <label for="select-silence-split" class="field-label">Silence Pause Threshold</label>
+                <select id="select-silence-split" class="field-select">
+                  <option value="0.8">0.8 seconds (Fast Turn-Taking)</option>
+                  <option value="1.0">1.0 second</option>
+                  <option value="1.2" selected>1.2 seconds (Default — Regos &amp; Numbers)</option>
+                  <option value="1.5">1.5 seconds (Slow / Deliberate Speech)</option>
+                </select>
+              </div>
+            </div>
+          </details>
 
           <p id="model-tradeoff-note" class="tradeoff-note"></p>
         </div>
@@ -150,6 +223,7 @@
             <div class="card-header-compact">
               <h2 id="meter-heading" class="section-title">Live System Audio Indicator</h2>
               <div class="meter-telemetry">
+                <span id="meter-lr-dbfs" class="mono-stat">L: -100.0 / R: -100.0 dBFS</span>
                 <span id="meter-dbfs" class="mono-stat">-100.0 dBFS</span>
                 <span id="meter-voiceband" class="mono-stat">Voice Band: 0%</span>
                 <span id="meter-vad-pill" class="mini-badge">Silence</span>
@@ -173,7 +247,7 @@
               <div>
                 <h2 id="transcript-heading" class="section-title">Live Transcription</h2>
                 <p class="micro-caption">
-                  Neutral source label: <strong>SYSTEM AUDIO</strong> (single mixed desktop output stream — active RAM only)
+                  Source: <strong>SYSTEM AUDIO</strong> · English Automotive &amp; Telephony Mode · Uncertain audio is flagged rather than guessed
                 </p>
               </div>
               <div id="processing-indicator" class="processing-indicator hidden" aria-live="polite">
@@ -194,15 +268,70 @@
                   No active transcription session
                 </p>
                 <p id="transcript-empty-desc" class="empty-desc">
-                  Click START TRANSCRIPTION, choose Entire Screen with "Share system audio" enabled, and play harmless test audio first to verify setup. Transcripts exist only in active memory and are erased immediately when stopped.
+                  Click START TRANSCRIPTION, choose Entire Screen with "Also share system audio" enabled, and play harmless test audio first to verify setup. Transcripts exist only in active memory and are erased immediately when stopped.
                 </p>
               </div>
             </div>
           </section>
         </div>
 
-        <!-- Right / Telemetry & Governance Column: F. Session Info + G. Privacy Panel + H. Softphone Diagnostics -->
-        <aside class="sidebar-column" aria-label="Session telemetry, privacy verification, and softphone diagnostics">
+        <!-- Right / Telemetry & Governance Column -->
+        <aside class="sidebar-column" aria-label="Audio diagnostics, quality control, session telemetry, and privacy verification">
+          <!-- Real-Time Audio Diagnostics Module (Section 4) -->
+          <section class="card diagnostics-card" aria-labelledby="rt-audio-diag-heading">
+            <div class="card-header-compact">
+              <h2 id="rt-audio-diag-heading" class="section-title">Real-Time Audio Diagnostics</h2>
+              <span id="rt-diag-health-badge" class="health-pill health-yellow">YELLOW · STANDBY</span>
+            </div>
+
+            <p id="rt-diag-health-summary" class="micro-caption">
+              Standby — start transcription or Test Audio Only to inspect live signal.
+            </p>
+
+            <!-- Separate NICE CXone & Avaya Session Indicators -->
+            <div class="softphone-indicators-row" aria-label="Phone system diagnostic indicators">
+              <div class="softphone-badge-box">
+                <span class="softphone-badge-label">NICE CXone Session</span>
+                <span id="diag-cxone-pill" class="softphone-pill sp-idle">IDLE · Not tested</span>
+              </div>
+              <div class="softphone-badge-box">
+                <span class="softphone-badge-label">Avaya Session</span>
+                <span id="diag-avaya-pill" class="softphone-pill sp-idle">IDLE · Not tested</span>
+              </div>
+            </div>
+
+            <dl class="rt-telemetry-grid">
+              <div class="rt-row"><dt>Capture source</dt><dd id="rt-capture-source">Not connected</dd></div>
+              <div class="rt-row"><dt>Audio track</dt><dd id="rt-track-avail">No usable track</dd></div>
+              <div class="rt-row"><dt>Track state</dt><dd id="rt-track-state" class="mono-value">idle</dd></div>
+              <div class="rt-row"><dt>Sample rate</dt><dd id="rt-sample-rate" class="mono-value">Standby (16 kHz Float32)</dd></div>
+              <div class="rt-row"><dt>Channels &amp; mix</dt><dd id="rt-channel-info">Standby (L/R inspect)</dd></div>
+              <div class="rt-row"><dt>Left / Right level</dt><dd id="rt-lr-levels" class="mono-value">-100.0 / -100.0 dBFS</dd></div>
+              <div class="rt-row"><dt>Avg RMS / Peak</dt><dd id="rt-rms-peak" class="mono-value">-100.0 / -100.0 dBFS</dd></div>
+              <div class="rt-row"><dt>Silence / Clipping</dt><dd id="rt-silence-clip" class="mono-value">Idle · Clean (0.0%)</dd></div>
+              <div class="rt-row"><dt>Audio activity</dt><dd id="rt-activity">Inactive (0% voice band)</dd></div>
+              <div class="rt-row"><dt>Audio processing</dt><dd id="rt-enhancement">Gentle Clarity (+0.0 dB)</dd></div>
+              <div class="rt-row"><dt>Recognition queue</dt><dd id="rt-queue" class="mono-value">Idle (0 queued)</dd></div>
+            </dl>
+          </section>
+
+          <!-- Transcription Quality Control System (Section 11) -->
+          <section class="card qc-card" aria-labelledby="qc-heading">
+            <div class="card-header-compact">
+              <h2 id="qc-heading" class="section-title">Transcription Quality Control</h2>
+              <span id="qc-health-badge" class="health-pill health-green">GREEN · READY</span>
+            </div>
+            <p id="qc-summary" class="micro-caption">
+              Standby — quality monitor flags quiet audio, clipping, delays, repetitions, and silence hallucinations without inventing words.
+            </p>
+            <dl class="rt-telemetry-grid">
+              <div class="rt-row"><dt>Quiet / Clipped segments</dt><dd id="qc-quiet-clip" class="mono-value">0 quiet · 0 clipped</dd></div>
+              <div class="rt-row"><dt>Uncertain segments flagged</dt><dd id="qc-uncertain" class="mono-value">0 flagged</dd></div>
+              <div class="rt-row"><dt>Blocked hallucinations / loops</dt><dd id="qc-suppressed" class="mono-value">0 blocked · 0 loops</dd></div>
+              <div class="rt-row"><dt>Delays / Dropped / Failures</dt><dd id="qc-delays-drops" class="mono-value">0 slow · 0 dropped · 0 err</dd></div>
+            </dl>
+          </section>
+
           <!-- F. Session Information -->
           <section class="card" aria-labelledby="session-info-heading">
             <h2 id="session-info-heading" class="section-title">Session Information</h2>
@@ -217,7 +346,7 @@
               </div>
               <div class="info-row">
                 <dt>Recognition engine</dt>
-                <dd id="info-engine">Whisper Base.en (Local ONNX)</dd>
+                <dd id="info-engine">Whisper Small.en (Local ONNX)</dd>
               </div>
               <div class="info-row">
                 <dt>Processing method</dt>
@@ -253,7 +382,7 @@
             <p id="privacy-statement" class="privacy-statement"></p>
 
             <p class="privacy-disclosure">
-              <strong>Model software assets vs. conversation data:</strong> Application-managed persistent caching (<code>Cache Storage</code>) is disabled. Standard browser HTTP caching of static website and Whisper ONNX software assets may occur; if cleared by Chrome, model weights (~42–78 MB WASM) re-download on a new session. Customer audio and transcripts are never cached, recorded, or stored.
+              <strong>Model software assets vs. conversation data:</strong> Application-managed persistent caching (<code>Cache Storage</code>) is disabled. Standard browser HTTP caching of static website and Whisper ONNX software assets may occur; customer audio, diagnostics, and transcripts exist only in temporary RAM and are cleared on STOP.
             </p>
 
             <div class="privacy-audit-actions">
@@ -275,11 +404,11 @@
             </div>
           </section>
 
-          <!-- H. NICE CXone & Avaya Audio Compatibility Diagnostics -->
+          <!-- H. NICE CXone & Avaya Compatibility Checklist -->
           <section class="card diagnostics-card" aria-labelledby="diagnostics-heading">
             <div class="card-header-compact">
               <h2 id="diagnostics-heading" class="section-title">
-                NICE CXone &amp; Avaya Audio Diagnostics
+                NICE CXone &amp; Avaya Compatibility Checklist
               </h2>
               <button
                 id="btn-run-audio-diag"
@@ -292,7 +421,7 @@
             </div>
 
             <p id="diag-profile-banner" class="micro-caption">
-              Diagnostic labels only — this application operates completely independently and never connects to NICE CXone or Avaya APIs, credentials, or call controls.
+              Diagnostic labels only — zero connection to NICE CXone or Avaya APIs, credentials, or call controls.
             </p>
 
             <ul id="diag-checklist" class="diag-checklist"></ul>
@@ -302,16 +431,16 @@
               <summary>Troubleshooting Windows, NICE CXone &amp; Avaya Audio</summary>
               <ul class="troubleshooting-list">
                 <li>
-                  <strong>Share Entire Screen:</strong> In Chrome's prompt, select the <em>Entire Screen</em> tab (not an individual Window) and switch ON <em>Also share system audio</em>.
+                  <strong>Avaya Background Audio Mute:</strong> Keep Avaya's <em>Mute background sound</em> setting turned <strong>OFF</strong> (and Windows Sound → <em>Communications</em> set to <em>Do nothing</em>) so Windows loopback receives call audio.
                 </li>
                 <li>
-                  <strong>Playback vs. Communication Endpoint:</strong> Avaya and NICE CXone softphones often send call audio to Windows' <em>Default Communications Device</em>. Click the speaker icon on your Windows taskbar (no admin needed) and confirm your active output device is the same USB/Bluetooth/wired headset playing the call.
+                  <strong>Share Entire Screen:</strong> In Chrome's prompt, select <em>Entire Screen</em> and switch ON <em>Also share system audio</em>.
                 </li>
                 <li>
-                  <strong>Harmless Audio First:</strong> Always verify audio levels and speech clarity with harmless test audio before using during authorized live calls.
+                  <strong>Default Playback vs. Communications Device:</strong> Press <code>Win + R</code> → <code>mmsys.cpl</code> and ensure your headset has both the Green Checkmark and Green Telephone icon.
                 </li>
                 <li>
-                  <strong>No Microphone Fallback:</strong> By strict privacy design, this tool never switches to your microphone if system audio is missing.
+                  <strong>No Microphone Fallback:</strong> By strict privacy design, this tool never switches to your microphone.
                 </li>
               </ul>
             </details>

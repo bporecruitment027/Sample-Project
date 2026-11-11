@@ -12,6 +12,7 @@ import type {
   ModelKey,
   PreferredDeviceSetting,
   ProcessingDevice,
+  WhisperTimestampChunk,
 } from '../types/index.ts';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -77,11 +78,13 @@ async function createWhisperPipeline(
   modelId: string,
   device: ProcessingDevice,
 ): Promise<AutomaticSpeechRecognitionPipeline> {
+  // Use q8 merged decoder (not q4) on WebGPU: compatible with Xenova/whisper-*.en
+  // and eliminates 4-bit quantization errors on rego plates, names, and phone numbers.
   const dtype =
     device === 'webgpu'
       ? ({
           encoder_model: 'fp32',
-          decoder_model_merged: 'q4',
+          decoder_model_merged: 'q8',
         } as const)
       : ('q8' as const);
 
@@ -143,7 +146,6 @@ async function handleLoad(
     return;
   }
 
-  // Configure local same-origin ONNX Runtime Web WASM binaries
   const onnxWasm = env.backends?.onnx?.wasm;
   if (onnxWasm) {
     onnxWasm.wasmPaths = {
@@ -205,7 +207,7 @@ async function handleLoad(
   post({
     type: 'status',
     phase: 'downloading',
-    detail: `Loading ${modelId} (${targetDevice === 'webgpu' ? 'WebGPU' : 'WebAssembly q8'})...`,
+    detail: `Loading ${modelId} (${targetDevice === 'webgpu' ? 'WebGPU fp32/q8' : 'WebAssembly q8'})...`,
   });
 
   try {
@@ -221,7 +223,6 @@ async function handleLoad(
     });
   } catch (primaryErr) {
     if (targetDevice === 'webgpu') {
-      // Resilient fallback from WebGPU to CPU/WebAssembly if GPU shader/buffer creation fails
       const gpuErrMsg =
         primaryErr instanceof Error ? primaryErr.message : 'WebGPU session initialization failed';
       post({
@@ -292,29 +293,44 @@ async function handleTranscribe(requestId: number, audio: Float32Array): Promise
       )?.model?.generation_config?.is_multilingual,
     );
 
+    // Enable return_timestamps: true WITHOUT max_new_tokens cap so Whisper's
+    // _generate_with_seek() decodes full 20-second multi-sentence segments cleanly
+    // and returns chunk timestamps for accurate 3-second overlap deduplication.
     const options = isMultilingual
       ? {
           language: 'english',
           task: 'transcribe',
-          return_timestamps: false,
-          max_new_tokens: 128,
+          return_timestamps: true,
+          no_repeat_ngram_size: 5,
+          repetition_penalty: 1.03,
         }
       : {
-          return_timestamps: false,
-          max_new_tokens: 128,
+          return_timestamps: true,
+          no_repeat_ngram_size: 5,
+          repetition_penalty: 1.03,
         };
 
     const output = await activeTranscriber(audio, options);
     const processingMs = Math.round(performance.now() - startMs);
 
+    const singleOut = Array.isArray(output) ? output[0] : output;
     const rawText = Array.isArray(output)
       ? output.map((item) => item.text).join(' ')
       : output.text;
+
+    const rawChunks = (singleOut as { chunks?: Array<{ timestamp?: [number | null, number | null]; text?: string }> })?.chunks;
+    const chunks: WhisperTimestampChunk[] | undefined = Array.isArray(rawChunks)
+      ? rawChunks.map((c) => ({
+          timestamp: [c.timestamp?.[0] ?? null, c.timestamp?.[1] ?? null],
+          text: c.text ?? '',
+        }))
+      : undefined;
 
     post({
       type: 'transcription-result',
       requestId,
       text: rawText ?? '',
+      chunks,
       processingMs,
     });
   } catch (err) {
@@ -325,7 +341,7 @@ async function handleTranscribe(requestId: number, audio: Float32Array): Promise
       code: isOom ? 'INSUFFICIENT_RESOURCES' : 'TRANSCRIPTION_FAILED',
       requestId,
       message: isOom
-        ? 'Insufficient computer memory/GPU resources during local speech recognition. Try switching to Whisper Tiny.en.'
+        ? 'Insufficient computer memory/GPU resources during local speech recognition. Try switching to Whisper Base.en.'
         : 'A speech segment could not be processed by the local Whisper engine.',
     });
   } finally {

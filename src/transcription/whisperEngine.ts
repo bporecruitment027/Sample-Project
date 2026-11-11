@@ -1,5 +1,5 @@
 import { WHISPER_MODELS } from '../config/models.ts';
-import { deduplicateOverlapText } from '../audio/deduplicator.ts';
+import { deduplicateSegmentDetailed } from '../audio/deduplicator.ts';
 import { secureZeroFloat32 } from '../audio/dsp.ts';
 import type { SpeechSegmentPayload } from '../audio/vadSegmenter.ts';
 import { recordWorkerAuditEntry } from '../privacy/networkGuard.ts';
@@ -18,19 +18,40 @@ import type {
 interface QueuedSegmentItem {
   requestId: number;
   samples: Float32Array;
+  durationSec: number;
   hadBoundaryOverlap: boolean;
+  overlapDurationSec: number;
+  rms: number;
+  peak: number;
+  speechBandRatio: number;
+  clippedRatio: number;
   enqueuedAtClock: string;
 }
 
+export interface TranscribedSegmentMetaPayload {
+  text: string;
+  clockTimestamp: string;
+  processingMs: number;
+  durationSec: number;
+  rms: number;
+  peak: number;
+  speechBandRatio: number;
+  clippedRatio: number;
+  wasHallucinationBlocked: boolean;
+  wasRepetitionSuppressed: boolean;
+}
+
 export interface WhisperEngineCallbacks {
-  onModelLoadingStatus: (status: ModelLoadingStatus, progressPct: number | null, detail?: string) => void;
+  onModelLoadingStatus: (
+    status: ModelLoadingStatus,
+    progressPct: number | null,
+    detail?: string,
+  ) => void;
   onEngineReady: (modelKey: ModelKey, device: ProcessingDevice) => void;
   onQueueStateChange: (inFlight: boolean, queuedCount: number) => void;
-  onSegmentTranscribed: (payload: {
-    text: string;
-    clockTimestamp: string;
-    processingMs: number;
-  }) => void;
+  onSegmentTranscribed: (payload: TranscribedSegmentMetaPayload) => void;
+  onSegmentDroppedByBackpressure?: () => void;
+  onRecognitionFailure?: () => void;
   onAlert: (alert: AppAlert) => void;
 }
 
@@ -52,14 +73,11 @@ export class LocalWhisperEngine {
   private activeDevice: ProcessingDevice | null = null;
 
   private queue: QueuedSegmentItem[] = [];
-  private inFlightItem: {
-    requestId: number;
-    hadBoundaryOverlap: boolean;
-    enqueuedAtClock: string;
-  } | null = null;
+  private inFlightItem: Omit<QueuedSegmentItem, 'samples'> | null = null;
   private nextRequestId = 1;
   private acceptingResults = true;
   private lastTranscribedText = '';
+  private lastProcessingMs = 0;
   private fileProgressMap = new Map<string, number>();
 
   constructor(
@@ -90,6 +108,18 @@ export class LocalWhisperEngine {
 
   public get pendingCount(): number {
     return this.queue.length + (this.inFlightItem ? 1 : 0);
+  }
+
+  public get queueSnapshot(): {
+    inFlight: boolean;
+    queuedCount: number;
+    lastProcessingMs: number;
+  } {
+    return {
+      inFlight: Boolean(this.inFlightItem),
+      queuedCount: this.queue.length,
+      lastProcessingMs: this.lastProcessingMs,
+    };
   }
 
   public async initializeModel(
@@ -144,10 +174,6 @@ export class LocalWhisperEngine {
     return this.loadingPromise;
   }
 
-  /**
-   * Enqueues a speech segment for sequential local Whisper inference.
-   * Applies bounded backpressure protection so memory never grows unboundedly on slow CPUs.
-   */
   public enqueueSegment(segment: SpeechSegmentPayload): void {
     if (!this.acceptingResults || !this.worker || !this.ready) {
       secureZeroFloat32(segment.samples);
@@ -155,11 +181,11 @@ export class LocalWhisperEngine {
     }
 
     if (this.queue.length >= MAX_QUEUE_HARD_CAP) {
-      // Drop oldest queued buffer securely and warn rather than leaking RAM or freezing Chrome
       const dropped = this.queue.shift();
       if (dropped) {
         secureZeroFloat32(dropped.samples);
       }
+      this.callbacks.onSegmentDroppedByBackpressure?.();
       this.callbacks.onAlert({
         code: 'INSUFFICIENT_RESOURCES',
         severity: 'warning',
@@ -167,18 +193,19 @@ export class LocalWhisperEngine {
         message:
           'Local recognition queue reached its temporary memory safety limit (5 segments), so an older queued segment was discarded to prevent memory buildup.',
         remediation:
-          'Switch the model selector to "Whisper Tiny.en — Fast Performance Fallback" for ~2.5x faster processing on this PC.',
+          this.loadedModelKey === 'small.en'
+            ? 'Switch the model selector to "Whisper Base.en — Balanced Speed & Accuracy" for ~2.8x faster CPU processing.'
+            : 'Switch to "Whisper Tiny.en" or close unneeded browser tabs to free CPU/GPU cycles.',
       });
     } else if (this.queue.length + (this.inFlightItem ? 1 : 0) >= BACKPRESSURE_WARN_THRESHOLD) {
       this.callbacks.onAlert({
         code: 'INSUFFICIENT_RESOURCES',
         severity: 'warning',
         title: 'High Local Processing Latency Detected',
-        message:
-          `${this.queue.length + 1} speech segments are waiting for local CPU/GPU recognition.`,
+        message: `${this.queue.length + 1} speech segments are waiting for local CPU/GPU recognition.`,
         remediation:
-          this.loadedModelKey === 'base.en'
-            ? 'Consider switching to Whisper Tiny.en if transcription lags behind the conversation.'
+          this.loadedModelKey === 'small.en'
+            ? 'Consider switching to Whisper Base.en if transcription lags behind the conversation.'
             : 'Close unneeded browser tabs to free CPU/GPU cycles for local transcription.',
       });
     }
@@ -186,7 +213,13 @@ export class LocalWhisperEngine {
     const item: QueuedSegmentItem = {
       requestId: this.nextRequestId++,
       samples: segment.samples,
+      durationSec: segment.durationSec ?? segment.samples.length / 16_000,
       hadBoundaryOverlap: segment.hadBoundaryOverlap,
+      overlapDurationSec: segment.overlapDurationSec ?? (segment.hadBoundaryOverlap ? 3.0 : 0),
+      rms: segment.rms,
+      peak: segment.peak ?? Math.min(1, segment.rms * 3),
+      speechBandRatio: segment.speechBandRatio ?? 0.5,
+      clippedRatio: segment.clippedRatio ?? 0,
       enqueuedAtClock: new Date().toTimeString().slice(0, 8),
     };
 
@@ -194,9 +227,6 @@ export class LocalWhisperEngine {
     this.dispatchNextIfIdle();
   }
 
-  /**
-   * Clears pending queued segments and suppresses in-flight segment output (used on PAUSE and CLEAR).
-   */
   public discardPendingBuffers(resetDedupContext: boolean = false): void {
     for (const item of this.queue) {
       secureZeroFloat32(item.samples);
@@ -205,6 +235,7 @@ export class LocalWhisperEngine {
     this.inFlightItem = null;
     if (resetDedupContext) {
       this.lastTranscribedText = '';
+      this.lastProcessingMs = 0;
     }
     this.callbacks.onQueueStateChange(false, 0);
   }
@@ -216,12 +247,6 @@ export class LocalWhisperEngine {
     }
   }
 
-  /**
-   * Complete teardown invoked on STOP, error abort, and page unload:
-   * - Securely zeroes every pending audio buffer
-   * - Terminates the Web Worker thread immediately to release all WASM/WebGPU buffers
-   * - Clears deduplication state and model references
-   */
   public shutdownAndTerminate(): void {
     this.acceptingResults = false;
     this.discardPendingBuffers(true);
@@ -267,6 +292,7 @@ export class LocalWhisperEngine {
     };
     w.onerror = (err: ErrorEvent) => {
       this.ready = false;
+      this.callbacks.onRecognitionFailure?.();
       if (this.resolveLoading) {
         this.resolveLoading(false);
         this.resolveLoading = null;
@@ -277,7 +303,9 @@ export class LocalWhisperEngine {
         code: 'MODEL_LOAD_FAILED',
         severity: 'error',
         title: 'Local Recognition Worker Error',
-        message: err.message || 'The local speech recognition Web Worker encountered an unexpected error.',
+        message:
+          err.message ||
+          'The local speech recognition Web Worker encountered an unexpected error.',
       });
     };
     this.worker = w;
@@ -295,25 +323,21 @@ export class LocalWhisperEngine {
       return;
     }
 
-    this.inFlightItem = {
-      requestId: next.requestId,
-      hadBoundaryOverlap: next.hadBoundaryOverlap,
-      enqueuedAtClock: next.enqueuedAtClock,
-    };
+    const { samples, ...meta } = next;
+    this.inFlightItem = meta;
 
     this.callbacks.onQueueStateChange(true, this.queue.length);
 
     const msg: MainToWorkerMessage = {
       type: 'transcribe',
       requestId: next.requestId,
-      audio: next.samples,
+      audio: samples,
     };
 
     try {
-      // Transfer ownership of the underlying ArrayBuffer so main-thread copy becomes 0-byte detached immediately
-      this.worker.postMessage(msg, [next.samples.buffer]);
+      this.worker.postMessage(msg, [samples.buffer]);
     } catch {
-      secureZeroFloat32(next.samples);
+      secureZeroFloat32(samples);
       this.inFlightItem = null;
       this.callbacks.onQueueStateChange(false, this.queue.length);
     }
@@ -364,7 +388,7 @@ export class LocalWhisperEngine {
           title: 'WebGPU Unavailable — Using Local WebAssembly (CPU)',
           message: msg.reason,
           remediation:
-            'Local speech recognition continues privately via WebAssembly on your CPU. You can select Whisper Tiny.en for faster CPU speed if needed.',
+            'Local speech recognition continues privately via WebAssembly on your CPU. You can select Whisper Base.en for faster CPU speed if needed.',
         });
         break;
       }
@@ -392,18 +416,34 @@ export class LocalWhisperEngine {
         const completed = this.inFlightItem;
         if (completed && completed.requestId === msg.requestId) {
           this.inFlightItem = null;
+          this.lastProcessingMs = msg.processingMs;
           if (this.acceptingResults) {
-            const deduped = deduplicateOverlapText(
-              this.lastTranscribedText,
-              msg.text,
-              completed.hadBoundaryOverlap,
-            );
-            if (deduped) {
-              this.lastTranscribedText = deduped;
+            const dedupResult = deduplicateSegmentDetailed({
+              previousSegmentText: this.lastTranscribedText,
+              incomingSegmentText: msg.text,
+              chunks: msg.chunks,
+              hadBoundaryOverlap: completed.hadBoundaryOverlap,
+              overlapDurationSec: completed.overlapDurationSec,
+            });
+            if (dedupResult.text) {
+              this.lastTranscribedText = dedupResult.text;
+            }
+            if (
+              dedupResult.text ||
+              dedupResult.wasHallucinationBlocked ||
+              dedupResult.wasRepetitionSuppressed
+            ) {
               this.callbacks.onSegmentTranscribed({
-                text: deduped,
+                text: dedupResult.text,
                 clockTimestamp: completed.enqueuedAtClock,
                 processingMs: msg.processingMs,
+                durationSec: completed.durationSec,
+                rms: completed.rms,
+                peak: completed.peak,
+                speechBandRatio: completed.speechBandRatio,
+                clippedRatio: completed.clippedRatio,
+                wasHallucinationBlocked: dedupResult.wasHallucinationBlocked,
+                wasRepetitionSuppressed: dedupResult.wasRepetitionSuppressed,
               });
             }
           }
@@ -420,9 +460,12 @@ export class LocalWhisperEngine {
           this.resolveLoading = null;
           this.loadingPromise = null;
         }
-        if (msg.requestId !== undefined && this.inFlightItem?.requestId === msg.requestId) {
-          this.inFlightItem = null;
-          this.dispatchNextIfIdle();
+        if (msg.requestId !== undefined) {
+          this.callbacks.onRecognitionFailure?.();
+          if (this.inFlightItem?.requestId === msg.requestId) {
+            this.inFlightItem = null;
+            this.dispatchNextIfIdle();
+          }
         }
         this.callbacks.onAlert({
           code: msg.code,

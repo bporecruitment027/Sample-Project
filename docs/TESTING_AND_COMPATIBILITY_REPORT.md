@@ -8,8 +8,9 @@ Run the automated test suite from a development environment:
 npm test
 ```
 
-All **6 test suites (20 tests)** verify:
-1. `tests/dsp-and-worklet.test.ts` — Stereo-to-mono mixing, `48 kHz` & `44.1 kHz` → `16 kHz` anti-aliased resampling, `300–3400 Hz` telephony voice-band detection vs. `40 Hz` hum, buffer zeroing, and `public/audio-capture-worklet.js` execution (`pause` discard + `shutdown` teardown).
+All **7 test suites (26 tests)** verify:
+1. `tests/accuracy-diagnostics-qc.test.ts` — 64-phase Blackman-sinc anti-aliased resampling (`48 kHz` & `44.1 kHz` → `16 kHz` with `>55 dB` stopband attenuation), smart L/R stereo routing (`+6.02 dB` single-channel recovery & anti-phase protection), optional/bypassable `EphemeralAudioEnhancer`, `20s`/`3s`/`1.2s` VAD segmentation, 3s multi-word overlap deduplication, `TranscriptionQualityController` (`confirmed` vs `uncertain`), 14-metric Real-Time Audio Diagnostics (`GREEN`/`YELLOW`/`RED` + separate NICE CXone & Avaya badges), and `Whisper Small.en` default UI integration.
+2. `tests/dsp-and-worklet.test.ts` — Stereo-to-mono mixing, `48 kHz` & `44.1 kHz` → `16 kHz` anti-aliased resampling, `300–3400 Hz` telephony voice-band detection vs. `40 Hz` hum, buffer zeroing, and `public/audio-capture-worklet.js` execution (`pause` discard + `shutdown` teardown).
 2. `tests/vad-and-dedup.test.ts` — Voice Activity Detection (VAD), natural pause segmentation, long-utterance boundary overlap splitting, Whisper silence-hallucination suppression, and overlap duplicate-word removal.
 3. `tests/privacy-and-cleanup.test.ts` — **Test 1** (clean startup, zero automatic capture), **Test 7** (runtime blocking of `POST`/`PUT`/payloads, cloud STT APIs, NICE CXone & Avaya APIs, `WebSocket`, `EventSource`, `sendBeacon`, `RTCPeerConnection`, `MediaRecorder`, `getUserMedia`, `ServiceWorker`, plus storage audit), XSS-safe `textContent` rendering, and **Tests 5 & 6** (11-step `STOP` cleanup and zero state across page reload).
 4. `tests/capture-and-errors.test.ts` — **Tests 2 & 3** (screen-share permission flow, missing audio track abort without microphone fallback, permission denial, local model failure aborting capture per Section 7G, WebGPU → WASM fallback, external "Stop sharing" cleanup, and NICE CXone / Avaya / Combined diagnostic checks).
@@ -85,8 +86,9 @@ Select the diagnostic label in **Diagnostic Test Label** (`NICE CXone Test`, `Av
    - Open NICE CXone on Windows and play harmless test audio (such as CXone audio setup test tone/voice check) through your headset.
    - Click **Test Audio Only** (or **START TRANSCRIPTION**), share **Entire Screen + System Audio**, and verify all 6 checks in the **NICE CXone & Avaya Audio Diagnostics** card turn `PASS` (including pausing audio for 2 seconds to verify Check #6 Hold/Silence transition).
 2. **Avaya Test:**
-   - Open Avaya Workplace / softphone and play its built-in audio speaker test or harmless test call audio.
-   - Verify Check #2 (`Windows System Audio Track Returned`), Check #3 (`Actual Sound Energy`), and Check #4 (`300–3400 Hz Speech Clarity`). If Avaya plays into your headset while Check #3 stays `-100 dBFS`, click the Windows taskbar speaker icon (no admin rights needed) and ensure your active Windows playback device matches the headset used by Avaya.
+   - Open Avaya Workplace / softphone and ensure any Avaya setting that **mutes background sound on Windows** is turned **OFF** (when enabled, Avaya silences Windows desktop loopback audio).
+   - Play Avaya's built-in audio speaker test or harmless test call audio.
+   - Verify Check #2 (`Windows System Audio Track Returned`), Check #3 (`Actual Sound Energy`), and Check #4 (`300–3400 Hz Speech Clarity`), plus the **Avaya Session** indicator in **Real-Time Audio Diagnostics** (`GREEN`). If Avaya plays into your headset while Check #3 stays `-100 dBFS`, click the Windows taskbar speaker icon (no admin rights needed) and ensure your active Windows playback device matches the headset used by Avaya.
 3. **Combined Audio Test:**
    - Have both NICE CXone and Avaya open concurrently (idle or playing harmless test audio) and confirm neither application is disrupted and Chrome captures system output cleanly.
 
