@@ -159,7 +159,7 @@ describe('Test 1, Test 5, Test 6 & Test 7 — Privacy, Zero Persistence, XSS Saf
     });
     await new Promise((r) => setTimeout(r, 20));
 
-    // Feed 1.2s of simulated speech + 0.7s of silence through the worklet port
+    // Feed 1.2s of simulated speech + 1.3s of silence (>= 1.2s default pause threshold)
     const port = audioMocks.getLatestWorkletPort()!;
     for (let i = 0; i < 12; i++) {
       const voice = new Float32Array(1600);
@@ -168,7 +168,7 @@ describe('Test 1, Test 5, Test 6 & Test 7 — Privacy, Zero Persistence, XSS Saf
       }
       port.emitFromWorklet({ type: 'pcm', samples: voice });
     }
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 13; i++) {
       port.emitFromWorklet({ type: 'pcm', samples: new Float32Array(1600) });
     }
 

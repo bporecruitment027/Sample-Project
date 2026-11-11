@@ -126,7 +126,7 @@ describe('Test 8 — Extended 20-Minute Session Stability, Memory Bounds & Backp
       for (let f = 0; f < 10; f++) {
         port.emitFromWorklet({ type: 'pcm', samples: new Float32Array(speechTemplate) });
       }
-      for (let f = 0; f < 8; f++) {
+      for (let f = 0; f < 13; f++) {
         port.emitFromWorklet({ type: 'pcm', samples: new Float32Array(1600) });
       }
     }

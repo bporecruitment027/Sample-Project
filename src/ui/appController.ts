@@ -1,10 +1,16 @@
 import {
+  CAPTURE_SOURCE_MODES,
   DEFAULT_MODEL_KEY,
+  DEFAULT_VAD_CONFIG,
   DIAGNOSTIC_PROFILES,
   WHISPER_MODELS,
+  validateCaptureSourceMode,
+  validateChannelSelectionMode,
   validateDevicePreference,
   validateDiagnosticProfile,
+  validateEnhancementMode,
   validateModelKey,
+  validateVadConfig,
 } from '../config/models.ts';
 import { CompatibilityDiagnosticsEngine } from '../audio/compatibilityDiagnostics.ts';
 import { SystemAudioCaptureController } from '../audio/systemAudioCapture.ts';
@@ -14,15 +20,20 @@ import {
   runLivePrivacyAudit,
   verifyLocalProcessingConfiguration,
 } from '../privacy/storageAudit.ts';
+import { TranscriptionQualityController } from '../transcription/qualityControl.ts';
 import {
   LocalWhisperEngine,
+  type TranscribedSegmentMetaPayload,
   type WorkerLike,
 } from '../transcription/whisperEngine.ts';
 import type {
   AppAlert,
   AudioActivityStatus,
   AudioConnectionStatus,
+  AudioEnhancementMode,
   AudioLevelMetrics,
+  CaptureSourceMode,
+  ChannelSelectionMode,
   DiagnosticProfileId,
   ModelKey,
   ModelLoadingStatus,
@@ -30,6 +41,7 @@ import type {
   ProcessingDevice,
   ProcessingStatus,
   SessionLifecycleState,
+  TranscriptConfidenceTier,
   TranscriptSegment,
 } from '../types/index.ts';
 import { EphemeralLevelMeter } from './levelMeter.ts';
@@ -66,6 +78,7 @@ export class PrivateTranscriberAppController {
   private readonly vadSegmenter: EphemeralVadSegmenter;
   private readonly whisperEngine: LocalWhisperEngine;
   private readonly diagnosticsEngine: CompatibilityDiagnosticsEngine;
+  private readonly qualityController: TranscriptionQualityController;
   private readonly levelMeter: EphemeralLevelMeter;
 
   // Ephemeral active-session state (cleared completely on STOP / unload)
@@ -73,6 +86,9 @@ export class PrivateTranscriberAppController {
   private diagnosticsOnlyMode = false;
   private selectedModelKey: ModelKey = DEFAULT_MODEL_KEY;
   private selectedDevicePref: PreferredDeviceSetting = 'auto';
+  private selectedCaptureMode: CaptureSourceMode = 'entire-screen-system';
+  private selectedEnhancementMode: AudioEnhancementMode = 'gentle';
+  private selectedChannelMode: ChannelSelectionMode = 'auto';
   private selectedProfile: DiagnosticProfileId = 'standard';
   private activeDevice: ProcessingDevice | null = null;
   private connectionStatus: AudioConnectionStatus = 'Not connected';
@@ -93,6 +109,7 @@ export class PrivateTranscriberAppController {
   private readonly headerEngineBadge: HTMLElement;
   private readonly headerModeBadge: HTMLElement;
   private readonly standaloneTabLink: HTMLAnchorElement;
+  private readonly chromeStepHint: HTMLElement;
 
   private readonly alertRegion: HTMLElement;
   private readonly alertTitle: HTMLElement;
@@ -116,9 +133,16 @@ export class PrivateTranscriberAppController {
 
   private readonly selectModel: HTMLSelectElement;
   private readonly selectDevice: HTMLSelectElement;
+  private readonly selectCaptureMode: HTMLSelectElement;
+  private readonly selectEnhancement: HTMLSelectElement;
   private readonly selectProfile: HTMLSelectElement;
+  private readonly selectChannelMode: HTMLSelectElement;
+  private readonly selectSegLength: HTMLSelectElement;
+  private readonly selectSegOverlap: HTMLSelectElement;
+  private readonly selectSilenceSplit: HTMLSelectElement;
   private readonly modelTradeoffNote: HTMLElement;
 
+  private readonly meterLrDbfs: HTMLElement;
   private readonly meterDbfs: HTMLElement;
   private readonly meterVoiceband: HTMLElement;
   private readonly meterVadPill: HTMLElement;
@@ -129,6 +153,31 @@ export class PrivateTranscriberAppController {
   private readonly transcriptEmptyState: HTMLElement;
   private readonly transcriptEmptyTitle: HTMLElement;
   private readonly transcriptEmptyDesc: HTMLElement;
+
+  // Real-time Audio Diagnostics Panel elements
+  private readonly rtDiagHealthBadge: HTMLElement;
+  private readonly rtDiagHealthSummary: HTMLElement;
+  private readonly diagCxonePill: HTMLElement;
+  private readonly diagAvayaPill: HTMLElement;
+  private readonly rtCaptureSource: HTMLElement;
+  private readonly rtTrackAvail: HTMLElement;
+  private readonly rtTrackState: HTMLElement;
+  private readonly rtSampleRate: HTMLElement;
+  private readonly rtChannelInfo: HTMLElement;
+  private readonly rtLrLevels: HTMLElement;
+  private readonly rtRmsPeak: HTMLElement;
+  private readonly rtSilenceClip: HTMLElement;
+  private readonly rtActivity: HTMLElement;
+  private readonly rtEnhancement: HTMLElement;
+  private readonly rtQueue: HTMLElement;
+
+  // Quality Control Panel elements
+  private readonly qcHealthBadge: HTMLElement;
+  private readonly qcSummary: HTMLElement;
+  private readonly qcQuietClip: HTMLElement;
+  private readonly qcUncertain: HTMLElement;
+  private readonly qcSuppressed: HTMLElement;
+  private readonly qcDelaysDrops: HTMLElement;
 
   private readonly infoDuration: HTMLElement;
   private readonly infoConnection: HTMLElement;
@@ -162,6 +211,7 @@ export class PrivateTranscriberAppController {
       this.root,
       'standalone-tab-link',
     );
+    this.chromeStepHint = getRequiredElement(this.root, 'chrome-step-hint');
 
     this.alertRegion = getRequiredElement(this.root, 'alert-region');
     this.alertTitle = getRequiredElement(this.root, 'alert-title');
@@ -188,9 +238,31 @@ export class PrivateTranscriberAppController {
 
     this.selectModel = getRequiredElement<HTMLSelectElement>(this.root, 'select-model');
     this.selectDevice = getRequiredElement<HTMLSelectElement>(this.root, 'select-device');
+    this.selectCaptureMode = getRequiredElement<HTMLSelectElement>(
+      this.root,
+      'select-capture-mode',
+    );
+    this.selectEnhancement = getRequiredElement<HTMLSelectElement>(
+      this.root,
+      'select-enhancement',
+    );
     this.selectProfile = getRequiredElement<HTMLSelectElement>(this.root, 'select-profile');
+    this.selectChannelMode = getRequiredElement<HTMLSelectElement>(
+      this.root,
+      'select-channel-mode',
+    );
+    this.selectSegLength = getRequiredElement<HTMLSelectElement>(this.root, 'select-seg-length');
+    this.selectSegOverlap = getRequiredElement<HTMLSelectElement>(
+      this.root,
+      'select-seg-overlap',
+    );
+    this.selectSilenceSplit = getRequiredElement<HTMLSelectElement>(
+      this.root,
+      'select-silence-split',
+    );
     this.modelTradeoffNote = getRequiredElement(this.root, 'model-tradeoff-note');
 
+    this.meterLrDbfs = getRequiredElement(this.root, 'meter-lr-dbfs');
     this.meterDbfs = getRequiredElement(this.root, 'meter-dbfs');
     this.meterVoiceband = getRequiredElement(this.root, 'meter-voiceband');
     this.meterVadPill = getRequiredElement(this.root, 'meter-vad-pill');
@@ -204,6 +276,29 @@ export class PrivateTranscriberAppController {
     this.transcriptEmptyState = getRequiredElement(this.root, 'transcript-empty-state');
     this.transcriptEmptyTitle = getRequiredElement(this.root, 'transcript-empty-title');
     this.transcriptEmptyDesc = getRequiredElement(this.root, 'transcript-empty-desc');
+
+    this.rtDiagHealthBadge = getRequiredElement(this.root, 'rt-diag-health-badge');
+    this.rtDiagHealthSummary = getRequiredElement(this.root, 'rt-diag-health-summary');
+    this.diagCxonePill = getRequiredElement(this.root, 'diag-cxone-pill');
+    this.diagAvayaPill = getRequiredElement(this.root, 'diag-avaya-pill');
+    this.rtCaptureSource = getRequiredElement(this.root, 'rt-capture-source');
+    this.rtTrackAvail = getRequiredElement(this.root, 'rt-track-avail');
+    this.rtTrackState = getRequiredElement(this.root, 'rt-track-state');
+    this.rtSampleRate = getRequiredElement(this.root, 'rt-sample-rate');
+    this.rtChannelInfo = getRequiredElement(this.root, 'rt-channel-info');
+    this.rtLrLevels = getRequiredElement(this.root, 'rt-lr-levels');
+    this.rtRmsPeak = getRequiredElement(this.root, 'rt-rms-peak');
+    this.rtSilenceClip = getRequiredElement(this.root, 'rt-silence-clip');
+    this.rtActivity = getRequiredElement(this.root, 'rt-activity');
+    this.rtEnhancement = getRequiredElement(this.root, 'rt-enhancement');
+    this.rtQueue = getRequiredElement(this.root, 'rt-queue');
+
+    this.qcHealthBadge = getRequiredElement(this.root, 'qc-health-badge');
+    this.qcSummary = getRequiredElement(this.root, 'qc-summary');
+    this.qcQuietClip = getRequiredElement(this.root, 'qc-quiet-clip');
+    this.qcUncertain = getRequiredElement(this.root, 'qc-uncertain');
+    this.qcSuppressed = getRequiredElement(this.root, 'qc-suppressed');
+    this.qcDelaysDrops = getRequiredElement(this.root, 'qc-delays-drops');
 
     this.infoDuration = getRequiredElement(this.root, 'info-duration');
     this.infoConnection = getRequiredElement(this.root, 'info-connection');
@@ -227,8 +322,12 @@ export class PrivateTranscriberAppController {
 
     this.diagnosticsEngine = new CompatibilityDiagnosticsEngine();
     this.diagnosticsEngine.setProfile(this.selectedProfile);
+    this.qualityController = new TranscriptionQualityController();
 
     this.vadSegmenter = new EphemeralVadSegmenter({
+      maxSegmentSec: DEFAULT_VAD_CONFIG.maxSegmentSec,
+      overlapSec: DEFAULT_VAD_CONFIG.overlapSec,
+      silenceSplitSec: DEFAULT_VAD_CONFIG.silenceSplitSec,
       onSpeechStateChange: (speaking) => {
         if (this.lifecycleState === 'active' && !this.diagnosticsOnlyMode) {
           if (speaking && this.whisperEngine.pendingCount === 0) {
@@ -277,6 +376,12 @@ export class PrivateTranscriberAppController {
           this.infoMethod.textContent = methodLabel;
         },
         onQueueStateChange: (inFlight, queuedCount) => {
+          const qSnap = this.whisperEngine.queueSnapshot;
+          this.diagnosticsEngine.updateQueueTelemetry(
+            inFlight,
+            queuedCount,
+            qSnap.lastProcessingMs,
+          );
           const totalWaiting = (inFlight ? 1 : 0) + queuedCount;
           if (totalWaiting > 0 && this.lifecycleState === 'active') {
             this.processingIndicator.classList.remove('hidden');
@@ -295,12 +400,21 @@ export class PrivateTranscriberAppController {
               );
             }
           }
+          this.renderDiagnosticsPanel();
         },
-        onSegmentTranscribed: ({ text, clockTimestamp, processingMs }) => {
+        onSegmentTranscribed: (payload) => {
           if (this.lifecycleState !== 'active') {
             return;
           }
-          this.appendRecognizedSegment(text, clockTimestamp, processingMs);
+          this.handleRecognizedSegmentPayload(payload);
+        },
+        onSegmentDroppedByBackpressure: () => {
+          this.qualityController.recordDroppedSegment();
+          this.renderQualityControlPanel();
+        },
+        onRecognitionFailure: () => {
+          this.qualityController.recordRecognitionFailure();
+          this.renderQualityControlPanel();
         },
         onAlert: (alert) => {
           this.showAlert(alert);
@@ -345,6 +459,7 @@ export class PrivateTranscriberAppController {
     this.verifyAndRenderPrivacyGate();
     this.updateModelTradeoffDescription();
     this.renderDiagnosticsPanel();
+    this.renderQualityControlPanel();
     this.bindUiEvents();
 
     if (typeof window !== 'undefined' && window.self !== window.top) {
@@ -352,7 +467,6 @@ export class PrivateTranscriberAppController {
       this.standaloneTabLink.classList.remove('hidden');
     }
 
-    // Detect browser page reload using ephemeral PerformanceNavigationTiming (zero storage!)
     this.checkNavigationReloadNotice();
     this.syncControlButtons();
   }
@@ -440,6 +554,73 @@ export class PrivateTranscriberAppController {
       }
     });
 
+    this.selectCaptureMode.addEventListener('change', () => {
+      try {
+        this.selectedCaptureMode = validateCaptureSourceMode(this.selectCaptureMode.value);
+        this.audioCapture.setCaptureMode(this.selectedCaptureMode);
+        this.chromeStepHint.textContent =
+          CAPTURE_SOURCE_MODES[this.selectedCaptureMode].chromeStepHint;
+      } catch (err) {
+        this.showAlert({
+          code: 'TRANSCRIPTION_FAILED',
+          severity: 'error',
+          title: 'Invalid Capture Mode',
+          message: err instanceof Error ? err.message : 'Invalid capture mode.',
+        });
+      }
+    });
+
+    this.selectEnhancement.addEventListener('change', () => {
+      try {
+        this.selectedEnhancementMode = validateEnhancementMode(this.selectEnhancement.value);
+        this.audioCapture.setEnhancementMode(this.selectedEnhancementMode);
+        this.renderDiagnosticsPanel();
+      } catch (err) {
+        this.showAlert({
+          code: 'TRANSCRIPTION_FAILED',
+          severity: 'error',
+          title: 'Invalid Enhancement Mode',
+          message: err instanceof Error ? err.message : 'Invalid enhancement mode.',
+        });
+      }
+    });
+
+    this.selectChannelMode.addEventListener('change', () => {
+      try {
+        this.selectedChannelMode = validateChannelSelectionMode(this.selectChannelMode.value);
+        this.audioCapture.setChannelSelectionMode(this.selectedChannelMode);
+      } catch (err) {
+        this.showAlert({
+          code: 'TRANSCRIPTION_FAILED',
+          severity: 'error',
+          title: 'Invalid Channel Mode',
+          message: err instanceof Error ? err.message : 'Invalid channel selection mode.',
+        });
+      }
+    });
+
+    const handleVadTuningChange = () => {
+      try {
+        const validated = validateVadConfig({
+          maxSegmentSec: Number(this.selectSegLength.value),
+          overlapSec: Number(this.selectSegOverlap.value),
+          silenceSplitSec: Number(this.selectSilenceSplit.value),
+        });
+        this.vadSegmenter.updateTuning(validated);
+      } catch (err) {
+        this.showAlert({
+          code: 'TRANSCRIPTION_FAILED',
+          severity: 'error',
+          title: 'Invalid Segmentation Parameter',
+          message: err instanceof Error ? err.message : 'Invalid segmentation parameter.',
+        });
+      }
+    };
+
+    this.selectSegLength.addEventListener('change', handleVadTuningChange);
+    this.selectSegOverlap.addEventListener('change', handleVadTuningChange);
+    this.selectSilenceSplit.addEventListener('change', handleVadTuningChange);
+
     this.selectProfile.addEventListener('change', () => {
       try {
         this.selectedProfile = validateDiagnosticProfile(this.selectProfile.value);
@@ -492,8 +673,13 @@ export class PrivateTranscriberAppController {
 
   private checkNavigationReloadNotice(): void {
     try {
-      if (typeof performance !== 'undefined' && typeof performance.getEntriesByType === 'function') {
-        const navEntries = performance.getEntriesByType('navigation') as PerformanceNavigationTiming[];
+      if (
+        typeof performance !== 'undefined' &&
+        typeof performance.getEntriesByType === 'function'
+      ) {
+        const navEntries = performance.getEntriesByType(
+          'navigation',
+        ) as PerformanceNavigationTiming[];
         if (navEntries.length > 0 && navEntries[0].type === 'reload') {
           this.showAlert({
             code: 'TAB_REFRESHED',
@@ -542,10 +728,23 @@ export class PrivateTranscriberAppController {
       return;
     }
 
-    // Validate configuration inputs prior to session start
     this.selectedModelKey = validateModelKey(this.selectModel.value);
     this.selectedDevicePref = validateDevicePreference(this.selectDevice.value);
+    this.selectedCaptureMode = validateCaptureSourceMode(this.selectCaptureMode.value);
+    this.selectedEnhancementMode = validateEnhancementMode(this.selectEnhancement.value);
+    this.selectedChannelMode = validateChannelSelectionMode(this.selectChannelMode.value);
     this.selectedProfile = validateDiagnosticProfile(this.selectProfile.value);
+
+    const validatedVad = validateVadConfig({
+      maxSegmentSec: Number(this.selectSegLength.value),
+      overlapSec: Number(this.selectSegOverlap.value),
+      silenceSplitSec: Number(this.selectSilenceSplit.value),
+    });
+    this.vadSegmenter.updateTuning(validatedVad);
+
+    this.audioCapture.setCaptureMode(this.selectedCaptureMode);
+    this.audioCapture.setEnhancementMode(this.selectedEnhancementMode);
+    this.audioCapture.setChannelSelectionMode(this.selectedChannelMode);
     this.audioCapture.setDiagnosticProfile(this.selectedProfile);
     this.diagnosticsEngine.setProfile(this.selectedProfile);
 
@@ -558,15 +757,20 @@ export class PrivateTranscriberAppController {
       this.whisperEngine.isReady &&
       this.whisperEngine.currentModelKey === this.selectedModelKey;
 
-    // Initiate Chrome's getDisplayMedia() directly on the user's button click gesture
     const captureStarted = await this.audioCapture.startCapture(modelAlreadyReady);
+    const trackInfo = this.audioCapture.getTrackInfo();
+
     if (!captureStarted) {
-      const trackInfo = this.audioCapture.getTrackInfo();
       this.diagnosticsEngine.startSession({
         hasAudioTrack: false,
         trackLabel: trackInfo.trackLabel,
         sampleRateHz: trackInfo.sampleRateHz,
         isLive: false,
+        captureMode: trackInfo.captureMode,
+        displaySurface: trackInfo.displaySurface,
+        channelCount: trackInfo.channelCount,
+        trackReadyState: trackInfo.trackReadyState,
+        trackMuted: trackInfo.trackMuted,
       });
       this.renderDiagnosticsPanel();
       this.lifecycleState = 'idle';
@@ -574,20 +778,26 @@ export class PrivateTranscriberAppController {
       return;
     }
 
-    const trackInfo = this.audioCapture.getTrackInfo();
     this.diagnosticsEngine.startSession({
       hasAudioTrack: true,
       trackLabel: trackInfo.trackLabel,
       sampleRateHz: trackInfo.sampleRateHz,
       isLive: trackInfo.isLive,
+      captureMode: trackInfo.captureMode,
+      displaySurface: trackInfo.displaySurface,
+      channelCount: trackInfo.channelCount,
+      trackReadyState: trackInfo.trackReadyState,
+      trackMuted: trackInfo.trackMuted,
     });
+    this.qualityController.startSession();
     this.renderDiagnosticsPanel();
+    this.renderQualityControlPanel();
 
     this.lifecycleState = 'active';
     this.startSessionDurationClock();
     this.transcriptEmptyTitle.textContent = 'Listening to Windows system audio...';
     this.transcriptEmptyDesc.textContent =
-      'Play harmless spoken test audio or speak on an authorized call. Recognized sentences will appear here locally and vanish when you click STOP.';
+      'Play harmless spoken test audio or speak on an authorized call. Recognized sentences appear locally and are erased when you click STOP.';
     this.syncControlButtons();
 
     if (!modelAlreadyReady) {
@@ -598,8 +808,6 @@ export class PrivateTranscriberAppController {
       );
 
       if (!modelLoaded) {
-        // Strict Section 7G enforcement: if local recognition engine fails to initialize,
-        // immediately stop capturing customer audio and clean up!
         await this.stopSessionAndClearAll(false);
         return;
       }
@@ -622,7 +830,14 @@ export class PrivateTranscriberAppController {
       return;
     }
 
+    this.selectedCaptureMode = validateCaptureSourceMode(this.selectCaptureMode.value);
+    this.selectedEnhancementMode = validateEnhancementMode(this.selectEnhancement.value);
+    this.selectedChannelMode = validateChannelSelectionMode(this.selectChannelMode.value);
     this.selectedProfile = validateDiagnosticProfile(this.selectProfile.value);
+
+    this.audioCapture.setCaptureMode(this.selectedCaptureMode);
+    this.audioCapture.setEnhancementMode(this.selectedEnhancementMode);
+    this.audioCapture.setChannelSelectionMode(this.selectedChannelMode);
     this.audioCapture.setDiagnosticProfile(this.selectedProfile);
     this.diagnosticsEngine.setProfile(this.selectedProfile);
 
@@ -638,6 +853,11 @@ export class PrivateTranscriberAppController {
       trackLabel: trackInfo.trackLabel,
       sampleRateHz: trackInfo.sampleRateHz,
       isLive: trackInfo.isLive,
+      captureMode: trackInfo.captureMode,
+      displaySurface: trackInfo.displaySurface,
+      channelCount: trackInfo.channelCount,
+      trackReadyState: trackInfo.trackReadyState,
+      trackMuted: trackInfo.trackMuted,
     });
     this.renderDiagnosticsPanel();
 
@@ -653,7 +873,7 @@ export class PrivateTranscriberAppController {
     this.setProcessingStatus('Listening for speech');
     this.transcriptEmptyTitle.textContent = `Audio Compatibility Test Active (${DIAGNOSTIC_PROFILES[this.selectedProfile].label})`;
     this.transcriptEmptyDesc.textContent =
-      'Playing harmless sample audio now tests Chrome system audio capture, signal strength, and 300–3400 Hz speech clarity without buffering speech. Click STOP when done.';
+      'Play harmless sample audio to inspect Left/Right dBFS levels, sample-rate conversion, and 300–3400 Hz speech clarity without buffering speech. Click STOP when done.';
     this.syncControlButtons();
   }
 
@@ -686,20 +906,6 @@ export class PrivateTranscriberAppController {
     this.syncControlButtons();
   }
 
-  /**
-   * Executes the mandatory 11-step session cleanup sequence:
-   * 1. Stop screen-sharing audio capture
-   * 2. Stop all associated media tracks
-   * 3. Disconnect audio-processing nodes
-   * 4. Close AudioContext
-   * 5. Stop AudioWorklet
-   * 6. Terminate transcription worker
-   * 7. Discard & zero pending audio buffers
-   * 8. Clear all transcript text from RAM & DOM
-   * 9. Clear timestamps & session counters
-   * 10. Reset interface to initial state
-   * 11. Display "Session ended. Temporary session data cleared."
-   */
   public async stopSessionAndClearAll(
     showSessionEndedNotice: boolean = true,
     externalAlert?: AppAlert,
@@ -707,26 +913,23 @@ export class PrivateTranscriberAppController {
     this.lifecycleState = 'stopping';
     this.syncControlButtons();
 
-    // Steps 1–5: Stop capture, media tracks, nodes, AudioContext, and AudioWorklet
     await this.audioCapture.stopAndCleanup();
 
-    // Step 6 & 7: Terminate Web Worker and zero/discard all pending audio buffers
     this.vadSegmenter.clearAndZero();
     this.whisperEngine.shutdownAndTerminate();
     await purgeApplicationCacheStorage();
 
-    // Step 8: Clear all transcript text
     this.clearTranscriptMemoryAndDom(
       showSessionEndedNotice ? 'Session ended. Temporary session data cleared.' : undefined,
     );
 
-    // Step 9: Clear timestamps, session counters, and ephemeral diagnostic session data
     this.stopSessionDurationClock();
     this.infoDuration.textContent = '00:00:00';
     this.diagnosticsEngine.resetAndClear();
+    this.qualityController.resetAndClear();
     this.renderDiagnosticsPanel();
+    this.renderQualityControlPanel();
 
-    // Step 10: Reset interface to initial state
     this.diagnosticsOnlyMode = false;
     this.activeDevice = null;
     this.lifecycleState = 'idle';
@@ -734,6 +937,7 @@ export class PrivateTranscriberAppController {
     this.setActivityStatus('Audio inactive');
     this.setProcessingStatus('Idle');
     this.levelMeter.renderIdle();
+    this.meterLrDbfs.textContent = 'L: -100.0 / R: -100.0 dBFS';
     this.meterDbfs.textContent = '-100.0 dBFS';
     this.meterVoiceband.textContent = 'Voice Band: 0%';
     this.meterVadPill.textContent = 'Silence';
@@ -750,7 +954,6 @@ export class PrivateTranscriberAppController {
 
     this.syncControlButtons();
 
-    // Step 11: Display confirmation message
     if (externalAlert) {
       this.showAlert(externalAlert);
     } else if (showSessionEndedNotice) {
@@ -770,6 +973,7 @@ export class PrivateTranscriberAppController {
     void this.audioCapture.stopAndCleanup();
     this.clearTranscriptMemoryAndDom();
     this.diagnosticsEngine.resetAndClear();
+    this.qualityController.resetAndClear();
   }
 
   private clearTranscriptMemoryAndDom(emptyHeadline?: string): void {
@@ -778,17 +982,16 @@ export class PrivateTranscriberAppController {
       this.recentHighlightTimer = null;
     }
 
-    // Explicitly clear string references in segment objects before dropping array
     for (const seg of this.segments) {
       seg.text = '';
       seg.clockTimestamp = '';
       seg.elapsedTimestamp = '';
+      seg.qualityNote = undefined;
     }
     this.segments = [];
     this.nextSegmentId = 1;
     this.whisperEngine.discardPendingBuffers(true);
 
-    // Remove all segment cards from DOM while preserving the empty-state node
     const children = Array.from(this.transcriptFeed.children);
     for (const child of children) {
       if (child.id !== 'transcript-empty-state') {
@@ -800,17 +1003,46 @@ export class PrivateTranscriberAppController {
     this.transcriptEmptyTitle.textContent =
       emptyHeadline ?? 'No active transcription session';
     this.transcriptEmptyDesc.textContent =
-      'Click START TRANSCRIPTION, choose Entire Screen with "Share system audio" enabled, and play harmless test audio first to verify setup. Transcripts exist only in active memory and are erased immediately when stopped.';
+      'Click START TRANSCRIPTION, choose Entire Screen with "Also share system audio" enabled, and play harmless test audio first to verify setup. Transcripts exist only in active memory and are erased immediately when stopped.';
 
     this.syncControlButtons();
+  }
+
+  private handleRecognizedSegmentPayload(payload: TranscribedSegmentMetaPayload): void {
+    const qcEval = this.qualityController.evaluateTranscribedSegment({
+      text: payload.text,
+      durationSec: payload.durationSec,
+      rms: payload.rms,
+      peak: payload.peak,
+      speechBandRatio: payload.speechBandRatio,
+      clippedRatio: payload.clippedRatio,
+      processingMs: payload.processingMs,
+      wasHallucinationBlocked: payload.wasHallucinationBlocked,
+      wasRepetitionSuppressed: payload.wasRepetitionSuppressed,
+    });
+
+    this.renderQualityControlPanel();
+
+    if (!qcEval.shouldEmit || !payload.text.trim()) {
+      return;
+    }
+
+    this.appendRecognizedSegment(
+      payload.text,
+      payload.clockTimestamp,
+      payload.processingMs,
+      qcEval.confidenceTier,
+      qcEval.qualityNote,
+    );
   }
 
   private appendRecognizedSegment(
     text: string,
     clockTimestamp: string,
     processingMs: number,
+    confidenceTier: TranscriptConfidenceTier = 'confirmed',
+    qualityNote?: string,
   ): void {
-    // Mark all previously rendered segments as FINALIZED
     for (const prev of this.segments) {
       prev.isRecent = false;
     }
@@ -818,8 +1050,8 @@ export class PrivateTranscriberAppController {
     existingCards.forEach((card) => {
       card.classList.remove('segment-card-recent');
       const badge = card.querySelector('.segment-state-badge');
-      if (badge) {
-        badge.textContent = 'FINALIZED';
+      if (badge && !badge.classList.contains('state-uncertain')) {
+        badge.textContent = 'CONFIRMED';
         badge.className = 'segment-state-badge state-finalized';
       }
     });
@@ -833,6 +1065,8 @@ export class PrivateTranscriberAppController {
       text,
       processingMs,
       isRecent: true,
+      confidenceTier,
+      qualityNote,
     };
     this.segments.push(segment);
 
@@ -840,7 +1074,10 @@ export class PrivateTranscriberAppController {
 
     // Safe DOM construction using textContent ONLY (never innerHTML)
     const card = document.createElement('article');
-    card.className = 'segment-card segment-card-recent';
+    card.className =
+      confidenceTier === 'uncertain'
+        ? 'segment-card segment-card-recent segment-card-uncertain'
+        : 'segment-card segment-card-recent';
     card.dataset.segmentId = String(segment.id);
 
     const metaRow = document.createElement('div');
@@ -860,8 +1097,13 @@ export class PrivateTranscriberAppController {
     metaLeft.append(speakerEl, timeEl);
 
     const stateBadge = document.createElement('span');
-    stateBadge.className = 'segment-state-badge state-recent';
-    stateBadge.textContent = 'NEWLY RECOGNIZED';
+    if (confidenceTier === 'uncertain') {
+      stateBadge.className = 'segment-state-badge state-uncertain';
+      stateBadge.textContent = 'UNCERTAIN — VERIFY';
+    } else {
+      stateBadge.className = 'segment-state-badge state-recent';
+      stateBadge.textContent = 'NEWLY RECOGNIZED';
+    }
 
     metaRow.append(metaLeft, stateBadge);
 
@@ -870,20 +1112,27 @@ export class PrivateTranscriberAppController {
     textPara.textContent = segment.text;
 
     card.append(metaRow, textPara);
-    this.transcriptFeed.appendChild(card);
 
-    // Keep scroll pinned smoothly to newest segment
+    if (qualityNote) {
+      const noteEl = document.createElement('p');
+      noteEl.className = 'segment-quality-note';
+      noteEl.textContent = qualityNote;
+      card.appendChild(noteEl);
+    }
+
+    this.transcriptFeed.appendChild(card);
     this.transcriptFeed.scrollTop = this.transcriptFeed.scrollHeight;
 
-    // Transition visual highlight from NEWLY RECOGNIZED to FINALIZED after 4.5s
     if (this.recentHighlightTimer !== null) {
       clearTimeout(this.recentHighlightTimer);
     }
     this.recentHighlightTimer = setTimeout(() => {
       segment.isRecent = false;
       card.classList.remove('segment-card-recent');
-      stateBadge.textContent = 'FINALIZED';
-      stateBadge.className = 'segment-state-badge state-finalized';
+      if (confidenceTier === 'confirmed') {
+        stateBadge.textContent = 'CONFIRMED';
+        stateBadge.className = 'segment-state-badge state-finalized';
+      }
     }, 4500);
 
     this.syncControlButtons();
@@ -891,6 +1140,9 @@ export class PrivateTranscriberAppController {
 
   private handleAudioLevelMetrics(metrics: AudioLevelMetrics): void {
     this.levelMeter.update(metrics);
+    const lDb = (metrics.leftDbfs ?? metrics.dbfs).toFixed(1);
+    const rDb = (metrics.rightDbfs ?? metrics.dbfs).toFixed(1);
+    this.meterLrDbfs.textContent = `L: ${lDb} / R: ${rDb} dBFS`;
     this.meterDbfs.textContent = `${metrics.dbfs.toFixed(1)} dBFS`;
     this.meterVoiceband.textContent = `Voice Band: ${Math.round(metrics.speechBandRatio * 100)}%`;
 
@@ -902,15 +1154,46 @@ export class PrivateTranscriberAppController {
       this.meterVadPill.className = 'mini-badge';
     }
 
+    this.qualityController.notifyLiveAudioFrame(metrics.rms);
     const trackInfo = this.audioCapture.getTrackInfo();
-    this.diagnosticsEngine.ingestMetrics(metrics, trackInfo.isLive);
+    this.diagnosticsEngine.ingestMetrics(metrics, trackInfo.isLive, {
+      readyState: trackInfo.trackReadyState,
+      muted: trackInfo.trackMuted,
+      displaySurface: trackInfo.displaySurface,
+    });
     this.renderDiagnosticsPanel();
+    this.renderQualityControlPanel();
   }
 
   private renderDiagnosticsPanel(): void {
     const snap = this.diagnosticsEngine.getSnapshot();
-    this.diagChecklist.replaceChildren();
+    const rt = snap.realtimeTelemetry;
 
+    // Update Real-Time Audio Diagnostics Card (Section 4)
+    this.rtDiagHealthBadge.textContent = `${rt.healthColor} · ${rt.healthColor === 'GREEN' ? 'HEALTHY' : rt.healthColor === 'RED' ? 'ISSUE' : 'CHECK'}`;
+    this.rtDiagHealthBadge.className = `health-pill health-${rt.healthColor.toLowerCase()}`;
+    this.rtDiagHealthSummary.textContent = rt.healthSummary;
+
+    this.diagCxonePill.textContent = `${rt.niceCxoneIndicator.color} · ${rt.niceCxoneIndicator.text}`;
+    this.diagCxonePill.className = `softphone-pill sp-${rt.niceCxoneIndicator.color.toLowerCase()}`;
+
+    this.diagAvayaPill.textContent = `${rt.avayaIndicator.color} · ${rt.avayaIndicator.text}`;
+    this.diagAvayaPill.className = `softphone-pill sp-${rt.avayaIndicator.color.toLowerCase()}`;
+
+    this.rtCaptureSource.textContent = rt.captureSourceLabel;
+    this.rtTrackAvail.textContent = rt.audioTrackAvailable;
+    this.rtTrackState.textContent = rt.trackStateLabel;
+    this.rtSampleRate.textContent = rt.sampleRateConversionLabel;
+    this.rtChannelInfo.textContent = rt.channelHandlingLabel;
+    this.rtLrLevels.textContent = `${rt.leftLevelDbfs} / ${rt.rightLevelDbfs}`;
+    this.rtRmsPeak.textContent = `${rt.avgRmsDbfs} / ${rt.peakLevelDbfs}`;
+    this.rtSilenceClip.textContent = `${rt.silenceDetectionLabel} · ${rt.clippingDetectionLabel}`;
+    this.rtActivity.textContent = rt.audioActivityLabel;
+    this.rtEnhancement.textContent = rt.audioProcessingLabel;
+    this.rtQueue.textContent = rt.recognitionQueueLabel;
+
+    // Update 6-step Softphone Compatibility Checklist
+    this.diagChecklist.replaceChildren();
     for (const item of snap.checks) {
       const li = document.createElement('li');
       li.className = 'diag-item';
@@ -938,6 +1221,24 @@ export class PrivateTranscriberAppController {
     this.diagVerdict.textContent = snap.summaryVerdict;
   }
 
+  private renderQualityControlPanel(): void {
+    const qc = this.qualityController.getSnapshot();
+    const stateWord =
+      qc.overallHealth === 'GREEN'
+        ? 'HEALTHY'
+        : qc.overallHealth === 'YELLOW'
+          ? 'ATTENTION'
+          : 'DEGRADED';
+
+    this.qcHealthBadge.textContent = `${qc.overallHealth} · ${stateWord}`;
+    this.qcHealthBadge.className = `health-pill health-${qc.overallHealth.toLowerCase()}`;
+    this.qcSummary.textContent = qc.statusSummary;
+    this.qcQuietClip.textContent = `${qc.veryQuietSegments} quiet · ${qc.clippedSegments} clipped`;
+    this.qcUncertain.textContent = `${qc.uncertainSegmentsCount} flagged`;
+    this.qcSuppressed.textContent = `${qc.blockedHallucinations} blocked · ${qc.suppressedRepetitions} loops`;
+    this.qcDelaysDrops.textContent = `${qc.highDelayEvents} slow · ${qc.droppedOrMissingSegments} dropped · ${qc.recognitionFailures} err`;
+  }
+
   private async handleRunPrivacyAuditClick(): Promise<void> {
     const report = await runLivePrivacyAudit();
     this.privacyVerifiedStamp.textContent = report.allChecksPassed
@@ -948,12 +1249,24 @@ export class PrivateTranscriberAppController {
     this.privacyAuditList.replaceChildren();
 
     const rows: Array<[string, string]> = [
-      ['Local recognition engine verified', report.localProcessingConfigured ? 'YES (Local ONNX)' : 'NO'],
+      [
+        'Local recognition engine verified',
+        report.localProcessingConfigured ? 'YES (Local ONNX)' : 'NO',
+      ],
       ['External audio / transcript bytes sent', `${report.outboundAudioOrTextBytesSent} bytes`],
-      ['localStorage / sessionStorage entries', `${report.localStorageEntries} / ${report.sessionStorageEntries}`],
-      ['IndexedDB / OPFS / Cookies', `${report.indexedDbDatabases} / ${report.opfsEntries} / ${report.cookieBytes} B`],
+      [
+        'localStorage / sessionStorage entries',
+        `${report.localStorageEntries} / ${report.sessionStorageEntries}`,
+      ],
+      [
+        'IndexedDB / OPFS / Cookies',
+        `${report.indexedDbDatabases} / ${report.opfsEntries} / ${report.cookieBytes} B`,
+      ],
       ['Application Cache Storage buckets', `${report.cacheStorageBuckets} (disabled)`],
-      ['Service Workers / MediaRecorder / Mic', `${report.serviceWorkersRegistered} / ${report.mediaRecorderCount} / ${report.microphoneRequestsCount}`],
+      [
+        'Service Workers / MediaRecorder / Mic',
+        `${report.serviceWorkersRegistered} / ${report.mediaRecorderCount} / ${report.microphoneRequestsCount}`,
+      ],
       ['Blocked non-GET or unauthorized calls', `${report.blockedNetworkAttempts}`],
     ];
 
@@ -986,7 +1299,7 @@ export class PrivateTranscriberAppController {
 
   private updateModelTradeoffDescription(): void {
     const spec = WHISPER_MODELS[this.selectedModelKey];
-    this.modelTradeoffNote.textContent = `${spec.parameters} · ${spec.license} · Download ~${spec.approxDownloadWasmMb} MB (WASM q8) / ~${spec.approxDownloadWebGpuMb} MB (WebGPU). ${spec.accuracySummary} ${spec.performanceSummary}`;
+    this.modelTradeoffNote.textContent = `${spec.parameters} · ${spec.license} · Download ~${spec.approxDownloadWasmMb} MB (WASM q8) / ~${spec.approxDownloadWebGpuMb} MB (WebGPU fp32+q8). ${spec.accuracySummary} ${spec.performanceSummary}`;
   }
 
   private setConnectionStatus(status: AudioConnectionStatus): void {
@@ -1029,6 +1342,7 @@ export class PrivateTranscriberAppController {
       this.infoDuration.textContent = formatDurationHhMmSs(secs);
       if (this.lifecycleState === 'active') {
         this.renderDiagnosticsPanel();
+        this.renderQualityControlPanel();
       }
     }, 1000);
   }
@@ -1037,9 +1351,10 @@ export class PrivateTranscriberAppController {
     if (this.sessionStartedAtMs === 0) {
       return 0;
     }
-    const now = this.lifecycleState === 'paused' && this.pauseBeganAtMs > 0
-      ? this.pauseBeganAtMs
-      : Date.now();
+    const now =
+      this.lifecycleState === 'paused' && this.pauseBeganAtMs > 0
+        ? this.pauseBeganAtMs
+        : Date.now();
     const activeMs = Math.max(0, now - this.sessionStartedAtMs - this.pausedAccumulatedMs);
     return Math.floor(activeMs / 1000);
   }
@@ -1075,6 +1390,7 @@ export class PrivateTranscriberAppController {
     this.btnPreload.disabled = !localOk || !isIdle || this.whisperEngine.isReady;
     this.selectModel.disabled = !isIdle;
     this.selectDevice.disabled = !isIdle;
+    this.selectCaptureMode.disabled = !isIdle;
   }
 
   public showAlert(alert: AppAlert): void {
@@ -1098,7 +1414,6 @@ export class PrivateTranscriberAppController {
     this.alertRemediation.textContent = '';
   }
 
-  // Getters exposed for automated verification tests
   public getTestSnapshot(): {
     lifecycleState: SessionLifecycleState;
     connectionStatus: AudioConnectionStatus;

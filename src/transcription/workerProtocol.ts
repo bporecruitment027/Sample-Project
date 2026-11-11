@@ -4,6 +4,7 @@ import type {
   NetworkAuditEntry,
   PreferredDeviceSetting,
   ProcessingDevice,
+  WhisperTimestampChunk,
 } from '../types/index.ts';
 
 export type MainToWorkerMessage =
@@ -51,6 +52,7 @@ export type WorkerToMainMessage =
       type: 'transcription-result';
       requestId: number;
       text: string;
+      chunks?: WhisperTimestampChunk[];
       processingMs: number;
     }
   | {

@@ -1,3 +1,5 @@
+import type { VadTuningConfig } from '../types/index.ts';
+import { DEFAULT_VAD_CONFIG } from '../config/models.ts';
 import {
   TARGET_SAMPLE_RATE,
   analyzeAudioFrame16k,
@@ -10,7 +12,11 @@ export interface SpeechSegmentPayload {
   samples: Float32Array;
   durationSec: number;
   hadBoundaryOverlap: boolean;
+  overlapDurationSec: number;
   rms: number;
+  peak: number;
+  speechBandRatio: number;
+  clippedRatio: number;
 }
 
 export interface VadSegmenterOptions {
@@ -21,27 +27,33 @@ export interface VadSegmenterOptions {
   silenceSplitSec?: number;
   maxSegmentSec?: number;
   preRollSec?: number;
+  postRollKeepSec?: number;
   overlapSec?: number;
   onSpeechStateChange?: (isSpeaking: boolean) => void;
   onSegmentReady: (segment: SpeechSegmentPayload) => void;
 }
 
 /**
- * Ephemeral Voice Activity Detector & Bounded Speech Segmenter.
+ * Ephemeral Voice Activity Detector & Bounded Speech Segmenter (v2).
  *
- * Holds only short-lived Float32Array chunks for the current utterance (max 8 seconds, ~512 KB),
- * transfers/emits completed segments for local Whisper inference, and overwrites discarded
- * temporary buffers with zeros immediately.
+ * Defaults tuned for Australian automotive customer-service telephony:
+ * - Segment length: 20.0 s (adjustable)
+ * - Segment overlap: 3.0 s (adjustable)
+ * - Silence threshold: 1.2 s (1.0–1.5 s range, adjustable; avoids cutting off regos & phone numbers)
+ * - Pre-roll: 0.65 s (beginning-of-sentence preservation)
+ * - Tail preservation: 0.45 s (end-of-sentence preservation while trimming excess silence)
+ * - Zero audio persistence: overwrites all temporary Float32Array buffers with 0 immediately.
  */
 export class EphemeralVadSegmenter {
   private readonly sampleRate: number;
   private readonly speechOnsetRms: number;
   private readonly speechHoldRms: number;
   private readonly minSpeechSamples: number;
-  private readonly silenceSplitSamples: number;
-  private readonly maxSegmentSamples: number;
+  private silenceSplitSamples: number;
+  private maxSegmentSamples: number;
   private readonly preRollMaxSamples: number;
-  private readonly overlapSamples: number;
+  private readonly postRollKeepSamples: number;
+  private overlapSamples: number;
   private readonly onSpeechStateChange?: (isSpeaking: boolean) => void;
   private readonly onSegmentReady: (segment: SpeechSegmentPayload) => void;
 
@@ -56,18 +68,45 @@ export class EphemeralVadSegmenter {
   private trailingSilenceSamples = 0;
   private isSpeaking = false;
   private currentSegmentHasOverlap = false;
+  private currentSegmentOverlapSamples = 0;
+
+  private adaptiveNoiseFloor = 0.0012;
+  private segmentClippedSamples = 0;
+  private segmentBandEnergyWeighted = 0;
+  private segmentTotalEnergy = 0;
 
   constructor(options: VadSegmenterOptions) {
     this.sampleRate = options.sampleRate ?? TARGET_SAMPLE_RATE;
-    this.speechOnsetRms = options.speechOnsetRms ?? 0.007;
-    this.speechHoldRms = options.speechHoldRms ?? 0.0045;
-    this.minSpeechSamples = Math.round((options.minSpeechSec ?? 0.55) * this.sampleRate);
-    this.silenceSplitSamples = Math.round((options.silenceSplitSec ?? 0.65) * this.sampleRate);
-    this.maxSegmentSamples = Math.round((options.maxSegmentSec ?? 12.0) * this.sampleRate);
-    this.preRollMaxSamples = Math.round((options.preRollSec ?? 0.45) * this.sampleRate);
-    this.overlapSamples = Math.round((options.overlapSec ?? 0.8) * this.sampleRate);
+    this.speechOnsetRms = options.speechOnsetRms ?? 0.0048;
+    this.speechHoldRms = options.speechHoldRms ?? 0.0032;
+    this.minSpeechSamples = Math.round((options.minSpeechSec ?? 0.30) * this.sampleRate);
+    this.silenceSplitSamples = Math.round(
+      (options.silenceSplitSec ?? DEFAULT_VAD_CONFIG.silenceSplitSec) * this.sampleRate,
+    );
+    this.maxSegmentSamples = Math.round(
+      (options.maxSegmentSec ?? DEFAULT_VAD_CONFIG.maxSegmentSec) * this.sampleRate,
+    );
+    this.preRollMaxSamples = Math.round((options.preRollSec ?? 0.65) * this.sampleRate);
+    this.postRollKeepSamples = Math.round((options.postRollKeepSec ?? 0.45) * this.sampleRate);
+    this.overlapSamples = Math.round(
+      (options.overlapSec ?? DEFAULT_VAD_CONFIG.overlapSec) * this.sampleRate,
+    );
     this.onSpeechStateChange = options.onSpeechStateChange;
     this.onSegmentReady = options.onSegmentReady;
+  }
+
+  public updateTuning(config: VadTuningConfig): void {
+    this.maxSegmentSamples = Math.round(config.maxSegmentSec * this.sampleRate);
+    this.overlapSamples = Math.round(config.overlapSec * this.sampleRate);
+    this.silenceSplitSamples = Math.round(config.silenceSplitSec * this.sampleRate);
+  }
+
+  public getTuning(): VadTuningConfig {
+    return {
+      maxSegmentSec: this.maxSegmentSamples / this.sampleRate,
+      overlapSec: this.overlapSamples / this.sampleRate,
+      silenceSplitSec: this.silenceSplitSamples / this.sampleRate,
+    };
   }
 
   public get speaking(): boolean {
@@ -84,17 +123,27 @@ export class EphemeralVadSegmenter {
     }
 
     const metrics = analyzeAudioFrame16k(chunk, this.filterState);
-    const threshold = this.isSpeaking ? this.speechHoldRms : this.speechOnsetRms;
+
+    // Update adaptive background noise floor conservatively during quiet periods
+    if (!this.isSpeaking && metrics.rms < this.speechOnsetRms) {
+      this.adaptiveNoiseFloor = 0.92 * this.adaptiveNoiseFloor + 0.08 * metrics.rms;
+      this.adaptiveNoiseFloor = Math.max(0.0004, Math.min(0.009, this.adaptiveNoiseFloor));
+    }
+
+    const dynamicOnset = Math.max(this.speechOnsetRms, this.adaptiveNoiseFloor * 2.15);
+    const dynamicHold = Math.max(this.speechHoldRms, this.adaptiveNoiseFloor * 1.55);
+    const threshold = this.isSpeaking ? dynamicHold : dynamicOnset;
+
     const voiceLikely =
       metrics.rms >= threshold &&
-      (metrics.speechBandRatio >= 0.14 || metrics.rms >= threshold * 2.4);
+      (metrics.speechBandRatio >= 0.11 || metrics.rms >= threshold * 2.1);
 
     if (!this.isSpeaking) {
       if (voiceLikely) {
         this.isSpeaking = true;
         this.onSpeechStateChange?.(true);
 
-        // Prepend pre-roll ring buffer so initial word onset is preserved
+        // Beginning-of-sentence preservation: prepend pre-roll ring buffer
         for (const pre of this.preRollChunks) {
           this.activeChunks.push(pre);
           this.activeTotalSamples += pre.length;
@@ -107,8 +156,11 @@ export class EphemeralVadSegmenter {
         this.activeTotalSamples += copy.length;
         this.activeSpeechSamples += copy.length;
         this.trailingSilenceSamples = 0;
+        this.segmentClippedSamples += metrics.clippedSampleCount;
+        const e = metrics.rms * metrics.rms * copy.length;
+        this.segmentTotalEnergy += e;
+        this.segmentBandEnergyWeighted += e * metrics.speechBandRatio;
       } else {
-        // Maintain bounded pre-roll ring buffer and securely zero evicted chunks
         const copy = new Float32Array(chunk);
         this.preRollChunks.push(copy);
         this.preRollSamples += copy.length;
@@ -124,12 +176,16 @@ export class EphemeralVadSegmenter {
       return;
     }
 
-    // Currently in an active speech segment
+    // Active speech segment accumulation
     const copy = new Float32Array(chunk);
     secureZeroFloat32(chunk);
 
     this.activeChunks.push(copy);
     this.activeTotalSamples += copy.length;
+    this.segmentClippedSamples += metrics.clippedSampleCount;
+    const chunkEnergy = metrics.rms * metrics.rms * copy.length;
+    this.segmentTotalEnergy += chunkEnergy;
+    this.segmentBandEnergyWeighted += chunkEnergy * metrics.speechBandRatio;
 
     if (voiceLikely) {
       this.activeSpeechSamples += copy.length;
@@ -138,31 +194,24 @@ export class EphemeralVadSegmenter {
       this.trailingSilenceSamples += copy.length;
     }
 
-    // Case 1: Natural conversational pause reached
+    // Case 1: Speaker finished thought (conversational silence >= 1.0–1.5s)
     if (this.trailingSilenceSamples >= this.silenceSplitSamples) {
       this.emitOrDiscardSegment(false);
       return;
     }
 
-    // Case 2: Continuous speech reached maxSegmentSamples -> split with short boundary overlap
+    // Case 2: Continuous monologue reached 20s segment limit -> split with 3s context overlap
     if (this.activeTotalSamples >= this.maxSegmentSamples) {
       this.emitOrDiscardSegment(true);
     }
   }
 
-  /**
-   * Flushes any valid buffered speech (e.g. at end of test clip) without retaining tail buffers.
-   */
   public flushPending(): void {
     if (this.isSpeaking && this.activeTotalSamples > 0) {
       this.emitOrDiscardSegment(false);
     }
   }
 
-  /**
-   * Immediately zeroes and discards all active, pre-roll, and filter state buffers.
-   * Invoked on PAUSE, STOP, error abort, and page unload.
-   */
   public clearAndZero(): void {
     for (const c of this.preRollChunks) {
       secureZeroFloat32(c);
@@ -177,6 +226,11 @@ export class EphemeralVadSegmenter {
     this.activeSpeechSamples = 0;
     this.trailingSilenceSamples = 0;
     this.currentSegmentHasOverlap = false;
+    this.currentSegmentOverlapSamples = 0;
+    this.segmentClippedSamples = 0;
+    this.segmentBandEnergyWeighted = 0;
+    this.segmentTotalEnergy = 0;
+    this.adaptiveNoiseFloor = 0.0012;
     resetBiquadBandpassState(this.filterState);
 
     if (this.isSpeaking) {
@@ -186,10 +240,10 @@ export class EphemeralVadSegmenter {
   }
 
   private emitOrDiscardSegment(keepOverlapForNext: boolean): void {
-    const merged = new Float32Array(this.activeTotalSamples);
+    const mergedFull = new Float32Array(this.activeTotalSamples);
     let offset = 0;
     for (const c of this.activeChunks) {
-      merged.set(c, offset);
+      mergedFull.set(c, offset);
       offset += c.length;
       secureZeroFloat32(c);
     }
@@ -198,44 +252,79 @@ export class EphemeralVadSegmenter {
 
     const hadEnoughSpeech = this.activeSpeechSamples >= this.minSpeechSamples;
     const hadIncomingOverlap = this.currentSegmentHasOverlap;
+    const incomingOverlapSec = hadIncomingOverlap
+      ? this.currentSegmentOverlapSamples / this.sampleRate
+      : 0;
+    const trailingSilence = this.trailingSilenceSamples;
+    const clippedRatio =
+      mergedFull.length > 0 ? this.segmentClippedSamples / mergedFull.length : 0;
+    const avgBandRatio =
+      this.segmentTotalEnergy > 1e-10
+        ? Math.min(1, Math.max(0, this.segmentBandEnergyWeighted / this.segmentTotalEnergy))
+        : 0;
 
     this.activeSpeechSamples = 0;
     this.trailingSilenceSamples = 0;
+    this.segmentClippedSamples = 0;
+    this.segmentBandEnergyWeighted = 0;
+    this.segmentTotalEnergy = 0;
 
-    if (keepOverlapForNext && merged.length > this.overlapSamples) {
-      const overlapTail = merged.slice(merged.length - this.overlapSamples);
+    if (keepOverlapForNext && mergedFull.length > this.overlapSamples) {
+      const overlapTail = mergedFull.slice(mergedFull.length - this.overlapSamples);
       this.activeChunks = [overlapTail];
       this.activeTotalSamples = overlapTail.length;
-      this.activeSpeechSamples = Math.floor(overlapTail.length * 0.5);
+      // Only count new non-overlap speech toward the next segment's minSpeech threshold
+      // unless actual voice continues after the split
+      this.activeSpeechSamples = Math.floor(this.minSpeechSamples * 0.5);
       this.currentSegmentHasOverlap = true;
-      // Remain in speaking state across forced mid-utterance split
+      this.currentSegmentOverlapSamples = overlapTail.length;
     } else {
       this.currentSegmentHasOverlap = false;
+      this.currentSegmentOverlapSamples = 0;
       this.isSpeaking = false;
       this.onSpeechStateChange?.(false);
     }
 
     if (!hadEnoughSpeech) {
-      secureZeroFloat32(merged);
+      secureZeroFloat32(mergedFull);
       return;
     }
 
-    let sumSq = 0;
-    for (let i = 0; i < merged.length; i++) {
-      sumSq += merged[i] * merged[i];
+    // End-of-sentence preservation: keep 0.45s natural tail while trimming excess trailing dead air
+    let finalSamples = mergedFull;
+    if (!keepOverlapForNext && trailingSilence > this.postRollKeepSamples) {
+      const excessSilence = trailingSilence - this.postRollKeepSamples;
+      const trimmedLen = Math.max(this.minSpeechSamples, mergedFull.length - excessSilence);
+      if (trimmedLen < mergedFull.length) {
+        finalSamples = mergedFull.slice(0, trimmedLen);
+        secureZeroFloat32(mergedFull);
+      }
     }
-    const rms = Math.sqrt(sumSq / merged.length);
 
-    if (rms < this.speechHoldRms * 0.75) {
-      secureZeroFloat32(merged);
+    let sumSq = 0;
+    let peak = 0;
+    for (let i = 0; i < finalSamples.length; i++) {
+      const s = finalSamples[i];
+      const abs = Math.abs(s);
+      if (abs > peak) peak = abs;
+      sumSq += s * s;
+    }
+    const rms = finalSamples.length > 0 ? Math.sqrt(sumSq / finalSamples.length) : 0;
+
+    if (rms < this.speechHoldRms * 0.65) {
+      secureZeroFloat32(finalSamples);
       return;
     }
 
     this.onSegmentReady({
-      samples: merged,
-      durationSec: merged.length / this.sampleRate,
+      samples: finalSamples,
+      durationSec: finalSamples.length / this.sampleRate,
       hadBoundaryOverlap: hadIncomingOverlap,
+      overlapDurationSec: incomingOverlapSec,
       rms,
+      peak,
+      speechBandRatio: avgBandRatio,
+      clippedRatio,
     });
   }
 }

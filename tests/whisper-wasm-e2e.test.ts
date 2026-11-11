@@ -171,17 +171,21 @@ describe('Test 4 — Real End-to-End Local Whisper ONNX WebAssembly Transcriptio
         const slice = resampled16k.slice(offset, Math.min(offset + 1600, resampled16k.length));
         vad.pushChunk16k(slice);
       }
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 13; i++) {
         vad.pushChunk16k(new Float32Array(1600));
       }
+      vad.flushPending();
       secureZeroFloat32(resampled16k);
 
       expect(segments.length).toBeGreaterThanOrEqual(1);
 
       // 4. Initialize browser Whisper ONNX pipeline on WebAssembly (device: 'wasm', dtype: 'q8')
+      const e2eModel = fs.existsSync(path.join(FIXTURE_MODELS_ROOT, 'Xenova/whisper-base/config.json'))
+        ? 'Xenova/whisper-base'
+        : 'Xenova/whisper-tiny';
       const transcriber = await pipeline(
         'automatic-speech-recognition',
-        'Xenova/whisper-tiny',
+        e2eModel,
         {
           device: 'wasm',
           dtype: 'q8',
@@ -196,8 +200,9 @@ describe('Test 4 — Real End-to-End Local Whisper ONNX WebAssembly Transcriptio
         const out = await transcriber(seg.samples, {
           language: 'english',
           task: 'transcribe',
-          return_timestamps: false,
-          max_new_tokens: 128,
+          return_timestamps: true,
+          no_repeat_ngram_size: 5,
+          repetition_penalty: 1.03,
         });
         secureZeroFloat32(seg.samples);
         expect(seg.samples.every((v) => v === 0)).toBe(true);

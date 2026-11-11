@@ -29,10 +29,11 @@
 4. **Web Audio API & `AudioWorklet` Pipeline (`public/audio-capture-worklet.js`)**
    - An audio-only `MediaStream` (`new MediaStream([primaryAudioTrack])`) feeds `MediaStreamAudioSourceNode` → `AudioWorkletNode('ephemeral-pcm-capture-processor')` → zero-gain `GainNode(0.0)` → `AudioContext.destination`.
    - Routing through `GainNode(0.0)` keeps Chromium's pull-based Web Audio graph executing every 128-frame render quantum reliably while guaranteeing **0.000 audible loopback** (zero echo into the user's headset).
-   - Inside `AudioWorkletProcessor`:
-     - Multi-channel desktop audio is averaged to mono.
-     - An anti-aliasing boxcar resampler converts hardware sample rates (e.g., `48,000 Hz` or `44,100 Hz`) to `16,000 Hz` mono `Float32Array` PCM.
-     - Instantaneous scalar metrics (`rms`, `peak`, `300–3400 Hz` telephony voice-band energy ratio, `clipping`) are emitted every `50 ms` (`800` samples) for the Live Audio Indicator and Softphone Diagnostics — storing **zero** waveform history.
+   - Inside `AudioWorkletProcessor` & `src/audio/dsp.ts`:
+     - Left and Right stereo channels are inspected independently (`inspectAndMixChannels`) before downmixing so single-sided softphone voices retain full `+6.02 dB` amplitude and phase-inverted channels never cancel out.
+     - A **64-phase Blackman-windowed sinc anti-aliasing resampler** (`fc = 7,400 Hz`, `>55 dB` stopband attenuation) converts hardware sample rates (`48,000 Hz`, `44,100 Hz`, etc.) to genuine `16,000 Hz` mono `Float32Array` PCM normalized within `[-1.0, +1.0]`.
+     - Optional, bypassable `EphemeralAudioEnhancer` (`Gentle Clarity`, `Quiet Call Boost`, or `Raw Bypass (Off)`) applies an `85 Hz` Butterworth rumble filter, `+1.6 dB` `1.85 kHz` consonant presence shelf, `-19 dBFS` safe RMS normalization, and soft-knee peak limiting in RAM.
+     - Instantaneous scalar metrics (`leftDbfs`, `rightDbfs`, `dbfs`, `peakDbfs`, `300–3400 Hz` telephony voice-band ratio, `clipping`, `channelTopology`) are emitted every `50 ms` (`800` samples) for the **Real-Time Audio Diagnostics** panel — storing **zero** waveform history.
      - Short `100 ms` (`1,600` sample = `6.4 KB`) PCM chunks are transferred via zero-copy `ArrayBuffer` ownership transfer (`[outgoing.buffer]`) to `EphemeralVadSegmenter`.
      - While **PAUSED**, the worklet discards all incoming audio frames immediately without buffering.
 
@@ -41,21 +42,22 @@
 ## 2. How the Local Whisper AI Model Processes Audio in the Browser
 
 1. **Voice Activity Detection (VAD) & Ephemeral Segmentation (`src/audio/vadSegmenter.ts`)**
-   - Incoming `100 ms` chunks at `16 kHz` are evaluated using RMS hysteresis + telephony speech-band energy (`300–3400 Hz`).
-   - Only a `0.45 s` (`7,200` sample) pre-roll ring buffer and the current active utterance (up to `12.0 s` max = `192,000` samples = `768 KB` RAM) are held temporarily.
-   - Utterances split cleanly on natural conversational pauses (`0.65 s` of silence). If continuous speech exceeds `12.0 s` without a pause, the segment flushes with a `0.8 s` boundary overlap tail so words straddling the split are not cut mid-syllable.
+   - Incoming `100 ms` chunks at `16 kHz` are evaluated using adaptive noise-floor RMS hysteresis + telephony speech-band energy (`300–3400 Hz`).
+   - Only a `0.65 s` (`10,400` sample) pre-roll ring buffer and the current active utterance (up to `20.0 s` default max = `320,000` samples = `1.28 MB` RAM) are held temporarily, plus a `0.45 s` post-roll tail so trailing consonants are never clipped.
+   - Utterances split cleanly on natural conversational pauses (`1.2 s` default, user-adjustable `1.0–1.5 s`). If continuous speech exceeds `20.0 s` without a pause, the segment flushes with a `3.0 s` boundary overlap tail so words straddling the split have rich acoustic context.
    - Evicted pre-roll chunks and merged source chunks are immediately overwritten with `0.0` (`Float32Array.fill(0)`).
 
 2. **Dedicated Web Worker & Local ONNX Inference (`src/workers/whisper.worker.ts`)**
-   - Completed speech segments are queued sequentially (`LocalWhisperEngine`, bounded cap of 5 segments with backpressure warnings at 3+ queued segments) and transferred (`[samples.buffer]`) to a dedicated Web Worker so the main UI thread never freezes.
-   - Inside the worker, Hugging Face `@huggingface/transformers` (`v4.3.2`) + `onnxruntime-web` runs **OpenAI Whisper** ONNX encoder-decoder inference entirely locally:
-     - **WebGPU Mode (when hardware adapter & shaders succeed)**: `encoder_model` in `fp32` + `decoder_model_merged` in `q4` 4-bit block quantization, accelerated on the local GPU.
+   - Completed speech segments are queued sequentially (`LocalWhisperEngine`, bounded FIFO cap of 8 segments with backpressure warnings) and transferred (`[samples.buffer]`) to a dedicated Web Worker so the main UI thread never freezes.
+   - Inside the worker, Hugging Face `@huggingface/transformers` (`v4.3.2`) + `onnxruntime-web` runs **OpenAI Whisper** ONNX encoder-decoder inference entirely locally (`return_timestamps: true`, `no_repeat_ngram_size: 5`, `repetition_penalty: 1.03`):
+     - **WebGPU Mode (when hardware adapter & shaders succeed)**: `encoder_model` in `fp32` + `decoder_model_merged` in `q8` 8-bit quantization, accelerated on the local GPU.
      - **WebAssembly Mode (automatic CPU fallback)**: `q8` 8-bit quantized encoder + decoder executed via local SIMD WebAssembly (`ort-wasm-simd-threaded.asyncify.wasm` served from `'self'`).
    - Inside the worker's `finally` block, `audio.fill(0)` wipes the segment's PCM buffer immediately after token decoding completes.
 
-3. **Hallucination Filtering & Overlap Deduplication (`src/audio/deduplicator.ts`)**
-   - Non-speech Whisper tags (`[BLANK_AUDIO]`, `(music)`, `[inaudible]`), caption-training artifacts (`"Thank you for watching"`, `"Subtitles by Amara.org"`), and degenerate 5x token-repetition loops are suppressed so text is never fabricated during silence or hold tones.
-   - When `hadBoundaryOverlap === true`, exact normalized suffix-prefix token matching removes repeated boundary words before rendering via `element.textContent`.
+3. **Hallucination Filtering, 3s Overlap Deduplication & Quality Control (`src/audio/deduplicator.ts`, `src/transcription/qualityControl.ts`)**
+   - Non-speech Whisper tags (`[BLANK_AUDIO]`, `(music)`, `[inaudible]`), caption-training artifacts (`"Thank you for watching"`, `"Subtitles by Amara.org"`), and degenerate token-repetition loops are suppressed so text is never fabricated during silence or hold tones.
+   - When `hadBoundaryOverlap === true`, `deduplicateSegmentDetailed()` combines Whisper chunk timestamps with up to 24-word exact/fuzzy suffix-prefix alignment to strip repeated boundary words cleanly before rendering via `element.textContent`.
+   - `TranscriptionQualityController` classifies each segment as **`CONFIRMED`** or **`UNCERTAIN — VERIFY`** and monitors quiet audio, clipping, prolonged silence, latency, and suppressed loops without guessing or altering rego plates, names, or numbers.
 
 ---
 
@@ -67,8 +69,9 @@ Only the open-source Whisper ONNX model software files are fetched via read-only
 
 | Model Option | Hugging Face Repository | License | Files Downloaded (Read-Only `GET`) | Approx. Size |
 |---|---|---|---|---|
-| **Whisper Base.en (Default)** | `onnx-community/whisper-base.en` | MIT | `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `preprocessor_config.json`, plus `onnx/encoder_model_quantized.onnx` & `onnx/decoder_model_merged_quantized.onnx` (WASM `q8`) OR `onnx/encoder_model.onnx` & `onnx/decoder_model_merged_q4.onnx` (WebGPU) | ~78 MB (WASM `q8`) / ~196 MB (WebGPU) |
-| **Whisper Tiny.en (Fallback)** | `onnx-community/whisper-tiny.en` | MIT | Same file structure as above for the 39M-parameter Tiny English architecture | ~42 MB (WASM `q8`) / ~108 MB (WebGPU) |
+| **Whisper Small.en (Preferred Default)** | `Xenova/whisper-small.en` | MIT | `config.json`, `generation_config.json`, `tokenizer.json`, `tokenizer_config.json`, `preprocessor_config.json`, plus `onnx/encoder_model_quantized.onnx` & `onnx/decoder_model_merged_quantized.onnx` (WASM `q8`) OR `onnx/encoder_model.onnx` & `onnx/decoder_model_merged_quantized.onnx` (WebGPU) | ~248 MB (WASM `q8`) / ~412 MB (WebGPU) |
+| **Whisper Base.en (Balanced Fallback)** | `Xenova/whisper-base.en` | MIT | Same file structure for the 74M-parameter Base English architecture | ~78 MB (WASM `q8`) / ~145 MB (WebGPU) |
+| **Whisper Tiny.en (Emergency Fallback)** | `Xenova/whisper-tiny.en` | MIT | Same file structure for the 39M-parameter Tiny English architecture | ~42 MB (WASM `q8`) / ~85 MB (WebGPU) |
 
 **Caching Disclosure:** Application-managed persistent caching (`env.useBrowserCache = false`, `env.useWasmCache = false`) is disabled so nothing is written to Chrome `Cache Storage`. Normal browser-managed HTTP caching of static website and model software files may occur; if Chrome evicts HTTP cache entries across sessions, model software weights will re-download on a new session.
 

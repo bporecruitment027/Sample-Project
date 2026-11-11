@@ -1,10 +1,32 @@
-export type ModelKey = 'base.en' | 'tiny.en';
+export type ModelKey = 'small.en' | 'base.en' | 'tiny.en';
 
 export type ProcessingDevice = 'webgpu' | 'wasm';
 
 export type PreferredDeviceSetting = 'auto' | 'webgpu' | 'wasm';
 
 export type DiagnosticProfileId = 'standard' | 'nice-cxone' | 'avaya' | 'combined';
+
+export type CaptureSourceMode =
+  | 'entire-screen-system'
+  | 'window-app-audio'
+  | 'window-system-audio';
+
+export type ChannelSelectionMode = 'auto' | 'left' | 'right' | 'stereo-sum';
+
+export type ChannelTopology =
+  | 'mono-input'
+  | 'identical-stereo'
+  | 'left-dominant'
+  | 'right-dominant'
+  | 'dual-independent'
+  | 'phase-inverted'
+  | 'silent';
+
+export type AudioEnhancementMode = 'gentle' | 'quiet-boost' | 'off';
+
+export type DiagnosticHealthColor = 'GREEN' | 'YELLOW' | 'RED';
+
+export type TranscriptConfidenceTier = 'confirmed' | 'uncertain';
 
 export type AudioConnectionStatus =
   | 'Not connected'
@@ -76,13 +98,36 @@ export interface WhisperModelSpec {
   recommendedFor: string;
 }
 
+export interface VadTuningConfig {
+  maxSegmentSec: number;
+  overlapSec: number;
+  silenceSplitSec: number;
+}
+
 export interface AudioLevelMetrics {
   rms: number;
   peak: number;
   dbfs: number;
+  peakDbfs?: number;
+  leftRms?: number;
+  rightRms?: number;
+  leftDbfs?: number;
+  rightDbfs?: number;
+  channelCount?: number;
+  channelTopology?: ChannelTopology;
+  channelCorrelation?: number;
+  sourceSampleRate?: number;
+  outputSampleRate?: number;
+  enhancementMode?: AudioEnhancementMode;
+  enhancementGainDb?: number;
   speechBandRatio: number;
   clipping: boolean;
   isSpeechActive: boolean;
+}
+
+export interface WhisperTimestampChunk {
+  timestamp: [number | null, number | null];
+  text: string;
 }
 
 export interface TranscriptSegment {
@@ -93,6 +138,8 @@ export interface TranscriptSegment {
   text: string;
   processingMs: number;
   isRecent: boolean;
+  confidenceTier: TranscriptConfidenceTier;
+  qualityNote?: string;
 }
 
 export interface NetworkAuditEntry {
@@ -138,6 +185,43 @@ export interface CompatibilityCheckItem {
   detail: string;
 }
 
+export interface RealtimeAudioDiagnosticsView {
+  healthColor: DiagnosticHealthColor;
+  healthSummary: string;
+  captureSourceLabel: string;
+  audioTrackAvailable: string;
+  trackStateLabel: string;
+  sampleRateConversionLabel: string;
+  channelHandlingLabel: string;
+  leftLevelDbfs: string;
+  rightLevelDbfs: string;
+  avgRmsDbfs: string;
+  peakLevelDbfs: string;
+  silenceDetectionLabel: string;
+  clippingDetectionLabel: string;
+  audioActivityLabel: string;
+  audioProcessingLabel: string;
+  recognitionQueueLabel: string;
+  niceCxoneIndicator: { color: DiagnosticHealthColor | 'IDLE'; text: string };
+  avayaIndicator: { color: DiagnosticHealthColor | 'IDLE'; text: string };
+}
+
+export interface QualityControlSnapshot {
+  overallHealth: DiagnosticHealthColor;
+  statusSummary: string;
+  veryQuietSegments: number;
+  clippedSegments: number;
+  extendedSilenceActive: boolean;
+  silenceDurationSec: number;
+  highDelayEvents: number;
+  lastProcessingMs: number;
+  recognitionFailures: number;
+  suppressedRepetitions: number;
+  blockedHallucinations: number;
+  droppedOrMissingSegments: number;
+  uncertainSegmentsCount: number;
+}
+
 export interface CompatibilityDiagnosticSnapshot {
   profile: DiagnosticProfileId;
   profileLabel: string;
@@ -150,6 +234,7 @@ export interface CompatibilityDiagnosticSnapshot {
   trackDropoutsObserved: number;
   trackLabel: string;
   sampleRateHz: number | null;
+  realtimeTelemetry: RealtimeAudioDiagnosticsView;
   checks: CompatibilityCheckItem[];
   summaryVerdict: string;
 }

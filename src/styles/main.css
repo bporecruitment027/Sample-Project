@@ -897,3 +897,162 @@ body {
   gap: 6px;
   color: var(--text-secondary);
 }
+
+/* Tuning Drawer */
+.tuning-drawer {
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
+.tuning-drawer summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.tuning-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+}
+
+/* Real-Time Audio Diagnostics & Quality Control */
+.health-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+  flex-shrink: 0;
+}
+
+.health-green {
+  background: var(--accent-emerald-bg);
+  color: var(--accent-emerald);
+  border-color: var(--accent-emerald-border);
+}
+
+.health-yellow {
+  background: var(--accent-amber-bg);
+  color: var(--accent-amber);
+  border-color: var(--accent-amber-border);
+}
+
+.health-red {
+  background: var(--accent-danger-bg);
+  color: var(--accent-danger);
+  border-color: var(--accent-danger-border);
+}
+
+.softphone-indicators-row {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.softphone-badge-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.softphone-badge-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.softphone-pill {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+.sp-idle {
+  background: #e2e8f0;
+  color: #475569;
+}
+
+.sp-green {
+  background: var(--accent-emerald-bg);
+  color: var(--accent-emerald);
+}
+
+.sp-yellow {
+  background: var(--accent-amber-bg);
+  color: var(--accent-amber);
+}
+
+.sp-red {
+  background: var(--accent-danger-bg);
+  color: var(--accent-danger);
+}
+
+.rt-telemetry-grid {
+  margin: 10px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.rt-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #f1f5f9;
+  font-size: 11.8px;
+}
+
+.rt-row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.rt-row dt {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.rt-row dd {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: right;
+}
+
+/* Uncertain vs Confirmed Transcript Styling */
+.segment-card-uncertain {
+  border-left-color: #d97706 !important;
+  background: #fffbeb;
+}
+
+.state-uncertain {
+  background: var(--accent-amber-bg);
+  color: var(--accent-amber);
+  border: 1px solid var(--accent-amber-border);
+}
+
+.segment-quality-note {
+  margin: 5px 0 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--accent-amber);
+}
